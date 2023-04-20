@@ -1,0 +1,193 @@
+use crate::{E, EOp1, EOp2, EOpn, EOpi, St};
+use lalrpop_util::ParseError;
+
+grammar;
+
+match {
+	r"\n\s*----*\s*\n" => {},
+	r"\s*" => {},
+	r"\\\*[^\n]*\n" => {},
+	r"\(\*([^(]+|\(+[^*])*\*\)" => {},
+} else {
+	"MODULE",
+	"ASSUME",
+	"CONSTANTS",
+	"VARIABLES",
+	"EXTENDS",
+	"SUBSET",
+	"UNION",
+	"EXCEPT",
+	"UNCHANGED",
+	"ENABLED",
+	"THEOREM",
+	r"[a-zA-Z][a-zA-Z0-9]*" => IDENT,
+	_,
+}
+
+Sep0<S, V>: Vec<V> = {
+	<mut vs:(<V> S)*> <v:V> => {
+		vs.push(v);
+		vs
+	},
+	"" => vec![],
+};
+Sep1<S, V>: Vec<V> = {
+	<mut vs:(<V> S)*> <v:V> => {
+		vs.push(v);
+		vs
+	}
+};
+
+TermPost: (char, Vec<E>) = {
+	"(" <Sep0<",", E>> ")" => ('(', <>),
+	"[" <E> "]" => ('[', vec![<>]),
+	"." <IDENT> => ('.', vec![E::Var(<>.to_string())]),
+};
+
+Bind: Vec<(Vec<String>, E)> = Sep1<",", (<Sep1<",", IDENT>> "\\in" <EOp1>)> => {
+	<>.into_iter().map(|(k, v)|
+		(k.into_iter().map(|k| k.to_string()).collect(), v)
+	)
+	.collect()
+};
+
+EMap: E = {
+	//"[" <Sep1<",", (<E> "|->" <E>)>> "]" =>
+	"[" <bind:E> "|->" <init:E> "]" =>? {
+		let err = Err(ParseError::User{ error: r"expected [ c \in S |-> T ]" });
+		match bind {
+			E::Op2(EOp2::In, var, set) => match *var {
+				E::Var(var) => Ok(E::Iter(EOpi::Map, vec![(vec![var], *set)], Box::new(init))),
+				_ => err,
+			},
+			_ => err,
+		}
+	},
+	"[" <e:E> <sub:r"]_[a-zA-Z][a-zA-Z0-9]*"> =>
+		E::Op2(EOp2::TStep, Box::new(E::Var(sub[2..].to_string())), Box::new(e)),
+	"[" <e0:E> "->" <e1:E> "]" => E::Op2(EOp2::Arrow, Box::new(e0), Box::new(e1)),
+	"[" <m:E> "EXCEPT" "![" <k:E> "]" "=" <v:E> "]" =>
+		E::Except(Box::new(m), Box::new(k), Box::new(v)),
+	"[" <m:E> "EXCEPT" <k:r"!.[a-zA-Z][a-zA-Z0-9]"> "=" <v:E> "]" =>
+		E::Except(Box::new(m), Box::new(E::Var(k[2..].to_string())), Box::new(v)),
+}
+
+ESet: E = {
+	"{" <init:E> ":" <bind:Bind> "}" => E::Iter(EOpi::Set, bind, Box::new(init)),
+	"{}" => E::Set(vec![]),
+	"{" <Sep0<",", E>> "}" => E::Set(<>),
+}
+E0: E = {
+	<name:IDENT> <next:"'"?> <post:TermPost*> => {
+		let mut e = match next {
+			Some(_) => E::Next(name.to_string()),
+			None => E::Var(name.to_string()),
+		};
+		post.into_iter().fold(e, |e, (c, mut es)| match c {
+			'(' => E::Opn(EOpn::Call, Box::new(e), es),
+			'[' => E::Op2(EOp2::Apply, Box::new(e), Box::new(es.pop().unwrap())),
+			'.' => E::Op2(EOp2::Apply, Box::new(e), Box::new(es.pop().unwrap())),
+			_ => unreachable!("TermPost limited to [(\\[.]"),
+		})
+	},
+	EMap,
+	ESet,
+	"(" <E> ")",
+	"<<" <Sep0<",", E>> ">>" => E::Tup(<>),
+	<name:r"[SW]F_[a-zA-Z][a-zA-Z0-9]*\("> <e:E> ")" => match &name[..1] {
+		"W" => E::Op2(EOp2::WFair, Box::new(E::Var(name[3..name.len()-1].to_string())), Box::new(e)),
+		"S" => E::Op2(EOp2::SFair, Box::new(E::Var(name[3..name.len()-1].to_string())), Box::new(e)),
+		_ => unreachable!("regex matches [WS]"),
+	},
+	<pre:r"[SW]F_<<"> <t:Sep0<",", IDENT>> ">>(" <e:E> ")" => match &pre[..1] {
+		"W" => E::Op2(EOp2::WFair, Box::new(E::Tup(t.into_iter().map(str::to_string).map(E::Var).collect())), Box::new(e)),
+		"S" => E::Op2(EOp2::SFair, Box::new(E::Tup(t.into_iter().map(str::to_string).map(E::Var).collect())), Box::new(e)),
+		_ => unreachable!("regex matches [WS]"),
+	},
+	"@" => E::Var(<>.to_string()),
+}
+
+EOp1: E =
+	<mut ops:Op1*> <mut e:E0> => {
+		while let Some(op) = ops.pop() {
+			e = E::Op1(op, Box::new(e));
+		}
+		e
+	};
+Op1: EOp1 = {
+	"SUBSET" => EOp1::Subset,
+	"UNION" => EOp1::Union,
+	"UNCHANGED" => EOp1::Unchanged,
+	"ENABLED" => EOp1::Enabled,
+	"[]" => EOp1::Ever,
+	"<>" => EOp1::Anon,
+};
+
+EOp2: E =
+	<mut vs:(EOp1 Op2)*> <mut e:EOp1> => {
+		while let Some((e0, op)) = vs.pop() {
+			e = E::Op2(op, Box::new(e0), Box::new(e));
+		}
+		e
+	};
+Op2NoIn: EOp2 = {
+	"\\subseteq" => EOp2::Subset,
+	"\\" => EOp2::SetSub,
+	"=" => EOp2::Eq,
+	"#" => EOp2::Neq,
+	"\\cup" => EOp2::Union,
+	"\\cap" => EOp2::Isect,
+	"=>" => EOp2::Imply,
+
+	"~>" => EOp2::TImply,
+};
+Op2: EOp2 = {
+	"\\in" => EOp2::In,
+	Op2NoIn,
+};
+
+Opi: EOpi = {
+	"\\A" => EOpi::All,
+	"\\E" => EOpi::Any,
+	"CHOOSE" => EOpi::Choose,
+}
+EOpi: E = {
+	<mut ops:(<Opi> <Bind> ":")*> <mut e:EOp2> => {
+		while let Some((op, b)) = ops.pop() {
+			e = E::Iter(op, b, Box::new(e));
+		}
+		e
+	},
+	"LET " <mut bind:Sep1<",", (<IDENT> "=" <E>)>> " IN " <body:EOpi> => {
+		E::Iter(EOpi::Let, bind.into_iter().map(|(c,e)| (vec![c.to_string()], e)).collect(), Box::new(body))
+	}
+}
+
+EOr: E = {
+	EOpi,
+	<e0:EOpi> <es:("\\/" <EOpi>)+> => E::Opn(EOpn::Or, Box::new(e0), es),
+	<e0:("\\/" <EOpi>)> <es:("\\/" <EOpi>)*> => E::Opn(EOpn::Or, Box::new(e0), es),
+}
+pub(crate) E: E = {
+	EOr,
+	<e0:EOr> <es:("/\\" <EOr>)+> => E::Opn(EOpn::And, Box::new(e0), es),
+	<e0:("/\\" <EOr>)> <es:("/\\" <EOr>)*> => E::Opn(EOpn::And, Box::new(e0), es),
+}
+
+
+St: St = {
+	"EXTENDS" <Sep1<",", IDENT>> => St::Extends(<>.into_iter().map(str::to_string).collect()),
+	"CONSTANTS" <Sep1<",", IDENT>> => St::Constants(<>.into_iter().map(str::to_string).collect()),
+	"VARIABLES" <Sep1<",", IDENT>> => St::Variables(<>.into_iter().map(str::to_string).collect()),
+	"ASSUME" <E> => St::Assume(<>),
+	<name:IDENT> <args:("(" <Sep1<",", IDENT>> ")")?> "==" <body:E> => {
+		St::Def(
+			name.to_string(),
+			args.unwrap_or_default().into_iter().map(str::to_string).collect(),
+			body)
+	},
+	"THEOREM" <E> => St::Theorem(<>),
+};
+
+pub(crate) Tla: (String, Vec<St>) =
+	r"----*" "MODULE" <name:IDENT> r"----*" <s:St*> r"====*" => (name.to_string(), s);
