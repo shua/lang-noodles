@@ -929,6 +929,7 @@ impl E {
 // --------------------------------
 // [e1]_e2 V s' \in {v...} \cup {s}
 //
+// maybe take a look at https://en.wikipedia.org/wiki/Computation_tree_logic
 
 impl E {
     fn map(mut self, f: impl for<'e> Fn(E) -> Result<E, E>) -> E {
