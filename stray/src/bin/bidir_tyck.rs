@@ -186,7 +186,8 @@ impl T {
                 let mark = B::M(y);
                 ctx.extend([mark.clone(), B::Ex(y)]);
                 let mut d = a.subtype(&ctx, rhs)?;
-                truncate_ctx(&mut d, &mark).expect("input context contained marker not foud in output context");
+                truncate_ctx(&mut d, &mark)
+                    .expect("input context contained marker not foud in output context");
                 Some(d)
             }
             (a, T::P(x, b)) => {
@@ -194,7 +195,8 @@ impl T {
                 let mark = B::V(x);
                 ctx.push(mark.clone());
                 let mut d = a.subtype(&ctx, b)?;
-                truncate_ctx(&mut d, &mark).expect("output context did not contain expected variable");
+                truncate_ctx(&mut d, &mark)
+                    .expect("output context did not contain expected variable");
                 Some(d)
             }
             (T::X(a), b) => {
@@ -268,7 +270,8 @@ impl T {
                     B::M(y)
                 };
                 let mut d = b.subtype_inst(a, &g, left)?;
-                truncate_ctx(&mut d, &mark).expect(&format!("expected output context to contain {mark:?}"));
+                truncate_ctx(&mut d, &mark)
+                    .expect(&format!("expected output context to contain {mark:?}"));
                 Some(d)
             }
             _ => None,
@@ -336,7 +339,8 @@ impl E {
                 let mut g = ctx.to_vec();
                 g.push(B::V(x));
                 let mut d = e.check(&g, &*a)?;
-                truncate_ctx(&mut d, &B::V(x)).expect("variable bound in input context, not found in output context");
+                truncate_ctx(&mut d, &B::V(x))
+                    .expect("variable bound in input context, not found in output context");
                 Some(d)
             }
             // ->I
@@ -345,7 +349,8 @@ impl E {
                 let mark = B::Is(x, *a.clone());
                 g.push(mark.clone());
                 let mut d = e.check(&g, &b)?;
-                truncate_ctx(&mut d, &mark).expect("variable annotated in input context, not found in output context");
+                truncate_ctx(&mut d, &mark)
+                    .expect("variable annotated in input context, not found in output context");
                 Some(d)
             }
             _ => None,
@@ -382,14 +387,14 @@ impl E {
             E::U => Some((T::U, ctx.to_vec())),
             // ->I=>
             E::L(x, e) => {
-                
                 let a = new_id();
                 let b = new_id();
                 let mut g = ctx.to_vec();
                 let mark = B::Is(x, T::X(a));
                 g.extend([B::Ex(a), B::Ex(b), mark.clone()]);
                 let mut d = e.check(&g, &T::X(b))?;
-                truncate_ctx(&mut d, &mark).expect("variable annotated in input context, not found in output context");
+                truncate_ctx(&mut d, &mark)
+                    .expect("variable annotated in input context, not found in output context");
                 Some((T::a(T::X(a), T::X(b)), d))
             }
             // ->E
@@ -491,7 +496,12 @@ mod test {
     fn test_esynth() {
         let g = ctx![];
         assert_eq!(expr!().synth(&g), Some((ty!(1), ctx![])));
-        assert_eq!(expr!(@x.()).synth(&g), Some((ty!(#0 -> #1), ctx![#0, #1 = 1])));
+        assert_eq!(
+            expr!(@x.()).synth(&g),
+            Some((ty!(#0 -> #1), ctx![#0, #1 = 1]))
+        );
         assert_eq!(expr!(x).synth(&ctx![x: 1]), Some((ty!(1), ctx![x: 1])));
     }
 }
+
+fn main() {}
