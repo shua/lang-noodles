@@ -4,8 +4,7 @@ use std::fmt::Debug;
 
 #[derive(Debug, Clone)]
 enum Expr {
-    Seq(Vec<Expr>),  // ws-separated exprs
-    Cont(Vec<Expr>), // contiguous exprs
+    Seq(bool, Vec<Expr>),
     Alt(Vec<Expr>),
     Many(Box<Expr>),
     Opt(Box<Expr>),
@@ -51,7 +50,7 @@ impl Terms {
     }
 
     fn fmt_suffix(&self, f: &mut std::fmt::Formatter, e: &Expr, suff: &str) -> std::fmt::Result {
-        if matches!(e, Expr::Seq(_) | Expr::Cont(_) | Expr::Alt(_)) {
+        if matches!(e, Expr::Seq(..) | Expr::Alt(_)) {
             f.write_str("(")?;
             self.fmt_expr(f, e)?;
             f.write_str(")")?;
@@ -91,8 +90,8 @@ impl Terms {
         }
 
         match e {
-            Expr::Seq(es) => self.fmt_join(f, es, " "),
-            Expr::Cont(es) => self.fmt_join(f, es, ""),
+            Expr::Seq(true, es) => self.fmt_join(f, es, " "),
+            Expr::Seq(false, es) => self.fmt_join(f, es, ""),
             Expr::Alt(es) => self.fmt_join(f, es, " / "),
             Expr::Many(e) => self.fmt_suffix(f, e, "*"),
             Expr::Opt(e) => self.fmt_suffix(f, e, "?"),
@@ -172,7 +171,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
         let mut altes = texpr.into_iter().map(|mut es| {
             // remove ws delimiters
             let match_delim = |e: Option<&_>| match e {
-                Some(&Expr::Cont(ref es)) if es.len() == 0 => true,
+                Some(&Expr::Seq(false, ref es)) if es.len() == 0 => true,
                 _ => false,
             };
             while match_delim(es.first()) {
@@ -188,7 +187,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
                     if cont.len() == 1 {
                         seq.push(cont.pop().unwrap());
                     } else {
-                        seq.push(Expr::Cont(cont));
+                        seq.push(Expr::Seq(false, cont));
                         cont = vec![];
                     }
                 } else {
@@ -198,12 +197,12 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
             match cont.len() {
                 0 => {}
                 1 => seq.push(cont.pop().unwrap()),
-                _ => seq.push(Expr::Cont(cont)),
+                _ => seq.push(Expr::Seq(false, cont)),
             }
             if seq.len() == 1 {
                 seq.pop().unwrap()
             } else {
-                Expr::Seq(seq)
+                Expr::Seq(true, seq)
             }
         });
         if altes.len() == 1 {
@@ -258,7 +257,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
             }
             (S::Expr | S::Atom, ' ' | '\t') => {
                 push_if_atom(&mut texpr, &mut s, &txt[j..i]);
-                push_seq(&mut texpr, Expr::Cont(vec![]));
+                push_seq(&mut texpr, Expr::Seq(false, vec![]));
             }
             (S::Expr | S::Atom, '*' | '?') => {
                 push_if_atom(&mut texpr, &mut s, &txt[j..i]);
@@ -365,7 +364,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
 
     fn ground(e: &mut Expr, ts: &[(usize, &str)]) {
         match e {
-            Expr::Seq(es) | Expr::Cont(es) | Expr::Alt(es) => {
+            Expr::Seq(_, es) | Expr::Alt(es) => {
                 es.iter_mut().for_each(|e| ground(e, ts));
             }
             Expr::Many(e) | Expr::Opt(e) => ground(&mut **e, ts),
@@ -384,7 +383,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
 
     fn convert_left_recursion(tid: usize, e: &mut Expr) -> Option<Expr> {
         match e {
-            Expr::Seq(es) | Expr::Cont(es) => {
+            Expr::Seq(_, es) => {
                 if let Some(Expr::Term(t)) = es.get(0) {
                     if *t == tid {
                         es.remove(0);
@@ -425,7 +424,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
                     *expr = es.pop().unwrap();
                 }
             }
-            Expr::Seq(es) | Expr::Cont(es) => {
+            Expr::Seq(_, es) => {
                 if let Some(tail) = convert_left_recursion(tid, expr) {
                     tail_exprs.push(tail);
                 }
@@ -440,7 +439,7 @@ fn parse_terms<'s>(txt: &'s str) -> Terms {
             };
             let mut head = Expr::Alt(vec![]);
             std::mem::swap(expr, &mut head);
-            *expr = Expr::Seq(vec![head, Expr::Many(Box::new(tail))]);
+            *expr = Expr::Seq(true, vec![head, Expr::Many(Box::new(tail))]);
         }
     }
 
@@ -552,11 +551,14 @@ impl Terms {
         Parser {
             terms,
             // we wrap the start term here to trim whitespace
-            expr: &Expr::Seq(vec![
-                Expr::Str(String::from("")),
-                Expr::Term(start),
-                Expr::Str(String::from("")),
-            ]),
+            expr: &Expr::Seq(
+                true,
+                vec![
+                    Expr::Str(String::from("")),
+                    Expr::Term(start),
+                    Expr::Str(String::from("")),
+                ],
+            ),
             cycles: &mut vec![false; self.0.len()],
             src,
         }
@@ -586,14 +588,14 @@ impl<'t, 's> Parser<'t, 's> {
 
     fn parse(&mut self, mut s: &'s str) -> ParseResult<'s> {
         match &self.expr {
-            Expr::Seq(es) | Expr::Cont(es) => {
+            Expr::Seq(wssep, es) => {
                 let ws = Expr::Many(Box::new(Expr::Set(true, String::from(" \t\n"))));
                 let mut nodes = vec![];
                 let mut node;
                 for e in es {
                     (node, s) = self.subexpr(e, s)?;
                     nodes.push(node);
-                    if matches!(&self.expr, Expr::Seq(es)) {
+                    if *wssep {
                         (_, s) = self.subexpr(&ws, s)?;
                     }
                 }
@@ -733,13 +735,23 @@ fn main() {
 
     let (mut stree, _) = pres.unwrap();
     stree.root.flatten();
-    stree.walk(|e| match e {
-        SynElem::Term(t, e1) if ts[*t].display == "r" || ts[*t].display == "v" => {
-            let span = e1.span();
-            **e1 = SynElem::Leaf(span);
-            false
+    stree.walk(|e| loop {
+        match e {
+            SynElem::Term(t, e1) if ts[*t].display == "r" || ts[*t].display == "v" => {
+                let span = e1.span();
+                **e1 = SynElem::Leaf(span);
+                return false;
+            }
+            SynElem::Term(t, e1) if ts[*t].display == "arg" => {
+                let inner = std::mem::replace(e, SynElem::Leaf(("", 0, 0)));
+                if let SynElem::Term(_, e1) = inner {
+                    *e = *e1;
+                } else {
+                    unreachable!("already checked pattern")
+                }
+            }
+            _ => return true,
         }
-        _ => true,
     });
     println!("{stree:?}");
 }
