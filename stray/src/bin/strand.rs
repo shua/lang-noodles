@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::convert::TryFrom;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 
 #[derive(Clone, PartialEq)]
 enum V {
@@ -159,8 +159,7 @@ fn main() {
         }
         procs.push_front((hd, args));
     }
-    let mut i = 0;
-    let mut clauses: Vec<(&str, usize, Vec<Thunk>, Vec<Thunk>)> = vec![
+    let clauses: Vec<(&str, usize, Vec<Thunk>, Vec<Thunk>)> = vec![
         (
             "div",
             3,
@@ -212,8 +211,6 @@ fn main() {
     }
 
     while let Some((hd, mut args)) = procs.pop_back() {
-        i += 1;
-
         for a in args.iter_mut() {
             match *a {
                 V::X(x) => *a = globals[x].clone(),
