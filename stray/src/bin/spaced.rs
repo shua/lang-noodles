@@ -146,24 +146,39 @@ fn parse_blocks<'t, R>(txt: &'t str, mut parse_leaf: impl FnMut(&'t str) -> Tree
 }
 
 impl<T> Tree<T> {
-    fn update<R>(self, mut f: impl FnMut(T) -> Tree<R>) -> Tree<R> {
-        fn inner<T, R>(root: Tree<T>, f: &mut dyn FnMut(T) -> Tree<R>) -> Tree<R> {
+    fn map_leaf<R>(self, mut f: impl FnMut(T) -> Tree<R>) -> Tree<R> {
+        self.map(f, Tree::Node)
+    }
+
+    fn map<R>(self, mut leaf: impl FnMut(T) -> R, mut node: impl FnMut(Vec<R>) -> R) -> R {
+        fn inner<T, R>(
+            root: Tree<T>,
+            leaf: &mut dyn FnMut(T) -> R,
+            node: &mut dyn FnMut(Vec<R>) -> R,
+        ) -> R {
             match root {
-                Tree::Node(vs) => Tree::Node(vs.into_iter().map(|t| inner(t, f)).collect()),
-                Tree::Leaf(v) => f(v),
+                Tree::Node(vs) => {
+                    let vs = vs.into_iter().map(|v| inner(v, leaf, node)).collect();
+                    node(vs)
+                }
+                Tree::Leaf(v) => leaf(v),
             }
         }
-        inner(self, &mut f)
+        inner(self, &mut leaf, &mut node)
     }
 }
 
 fn parse_nums(txt: &str) -> Tree<Result<u32, &str>> {
+    #[repr(u32)]
     #[derive(Debug, Clone, Copy)]
     enum State {
+        N2 = 2,
+        N10 = 10,
+        N16 = 16,
         S,
         P,
         I,
-        N(u32),
+        N0,
     }
     use State::*;
 
@@ -175,11 +190,11 @@ fn parse_nums(txt: &str) -> Tree<Result<u32, &str>> {
     while let Some((i, c)) = cs.next() {
         match (s, c) {
             (S, '0') => {
-                s = N(0);
+                s = N0;
                 tok_start = i;
             }
             (S, '1'..='9') => {
-                s = N(10);
+                s = N10;
                 tok_start = i;
             }
             (S, c) if c.is_alphabetic() || c == '_' => {
@@ -190,58 +205,55 @@ fn parse_nums(txt: &str) -> Tree<Result<u32, &str>> {
                 s = P;
                 tok_start = i;
             }
-            (N(0), '0'..='9' | '_') => {
-                s = N(10);
+            (N0, '0'..='9' | '_') => {
+                s = N10;
             }
-            (N(0), 'x') => {
-                s = N(16);
+            (N0, 'x') => {
+                s = N16;
                 tok_start = i + 1;
             }
-            (N(0), 'b') => {
-                s = N(2);
+            (N0, 'b') => {
+                s = N2;
                 tok_start = i + 1;
             }
-            (N(0), c) if c.is_alphabetic() || c == '_' => {
+            (N0, c) if c.is_alphabetic() || c == '_' => {
                 s = I;
                 tok_start = i;
                 seq.push(Tree::Leaf(Ok(0)));
             }
-            (N(0), c) => {
+            (N0, c) => {
                 s = P;
                 tok_start = i;
                 seq.push(Tree::Leaf(Ok(0)))
             }
-            (N(base), '_') => {
+            (N2 | N10 | N16, '_') => {
                 if tok_start != i {
-                    let n = u32::from_str_radix(&txt[tok_start..i], base).unwrap();
+                    let n = u32::from_str_radix(&txt[tok_start..i], s as u32).unwrap();
                     num += n;
                 }
                 tok_start = i + 1;
             }
-            (N(base @ 2), '0' | '1')
-            | (N(base @ 10), '0'..='9')
-            | (N(base @ 16), '0'..='9' | 'a'..='f' | 'A'..='F') => {
-                num *= base;
+            (N2, '0' | '1') | (N10, '0'..='9') | (N16, '0'..='9' | 'a'..='f' | 'A'..='F') => {
+                num *= s as u32;
             }
-            (N(base @ (2 | 10 | 16)), c) => {
+            (N2 | N10 | N16, c) => {
                 if c.is_alphabetic() {
                     s = I;
                 } else {
                     s = P;
                 }
-                let n = u32::from_str_radix(&txt[tok_start..i], base).unwrap();
+                let n = u32::from_str_radix(&txt[tok_start..i], s as u32).unwrap();
                 seq.push(Tree::Leaf(Ok(num + n)));
                 num = 0;
                 tok_start = i;
             }
-            (N(_), c) => unreachable!(),
             (P, '0') => {
-                s = N(0);
+                s = N0;
                 seq.push(Tree::Leaf(Err(&txt[tok_start..i])));
                 tok_start = i;
             }
             (P, '1'..='9') => {
-                s = N(10);
+                s = N10;
                 seq.push(Tree::Leaf(Err(&txt[tok_start..i])));
                 tok_start = i;
             }
@@ -264,13 +276,16 @@ fn parse_nums(txt: &str) -> Tree<Result<u32, &str>> {
     match s {
         S => {}
         P | I => seq.push(Tree::Leaf(Err(&txt[tok_start..]))),
-        N(0) => seq.push(Tree::Leaf(Ok(0))),
-        N(base @ (2 | 10 | 16)) => seq.push(Tree::Leaf(Ok(
-            num + u32::from_str_radix(&txt[tok_start..], base).unwrap()
+        N0 => seq.push(Tree::Leaf(Ok(0))),
+        N2 | N10 | N16 => seq.push(Tree::Leaf(Ok(
+            num + u32::from_str_radix(&txt[tok_start..], s as u32).unwrap()
         ))),
-        N(_) => unreachable!(),
     }
-    Tree::Node(seq)
+    if seq.len() == 1 {
+        seq.pop().unwrap()
+    } else {
+        Tree::Node(seq)
+    }
 }
 
 enum Expr {
@@ -348,7 +363,7 @@ mod test {
 fn main() {
     let mut blocks = parse_blocks(
         r#"
-			a + 2  *  - 3
+			a + 2  *  -3
 			foo
 		bar
 			baz
@@ -357,7 +372,5 @@ fn main() {
         |l| parse_spaced(l, Tree::Leaf),
     );
 
-    println!("{blocks:#?}");
-    let blocks = blocks.update(parse_nums);
     println!("{blocks:#?}");
 }
