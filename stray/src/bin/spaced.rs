@@ -237,12 +237,12 @@ fn parse_nums(txt: &str) -> Tree<Result<u32, &str>> {
                 num *= s as u32;
             }
             (N2 | N10 | N16, c) => {
+                let n = u32::from_str_radix(&txt[tok_start..i], s as u32).unwrap();
                 if c.is_alphabetic() {
                     s = I;
                 } else {
                     s = P;
                 }
-                let n = u32::from_str_radix(&txt[tok_start..i], s as u32).unwrap();
                 seq.push(Tree::Leaf(Ok(num + n)));
                 num = 0;
                 tok_start = i;
