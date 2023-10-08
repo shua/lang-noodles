@@ -14,12 +14,20 @@ macro_rules! debug {
 
 type TVar = &'static str;
 
+/// T represents types
+/// t0 ::= Unit | x | t0 -> t0    ; monotypes
+/// t ::= t0 | Pi x. t0 | t -> t  ; types
 #[derive(Clone, PartialEq)]
 enum T {
+    /// Unit type
     U,
+    /// x  type variable
     V(TVar),
+    /// a  existential type variable
     X(usize),
+    /// Pi x. t  pi type constructor
     P(TVar, Box<Self>),
+    /// t -> t  arrow type
     A(Box<Self>, Box<Self>),
 }
 
@@ -35,12 +43,19 @@ impl Debug for T {
     }
 }
 
+/// B is a contextual bound
+/// B ::= x | x: t | a | a = t0 | @a
 #[derive(Clone, PartialEq)]
 enum B {
+    /// x term variable
     V(TVar),
+    /// x:t term type bound
     Is(TVar, T),
+    /// a existential type variable
     Ex(usize),
+    /// a = t  existential type bound
     Eq(usize, T), // T should be a monotype, ie T::P is not allowed
+    /// @a  existential marker
     M(usize),
 }
 
@@ -64,11 +79,18 @@ fn new_id() -> usize {
     COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
+/// E is terms
+/// e ::= () | \x. e | e e | e: t | x
 enum E {
+    /// ()  unit
     U,
+    /// \x. e  lambda expression
     L(&'static str, Box<E>),
+    /// e e  application
     A(Box<E>, Box<E>),
+    /// e: t  type ascription
     T(Box<E>, T),
+    /// x  variable
     V(&'static str),
 }
 
@@ -97,48 +119,74 @@ impl T {
         }
     }
 
+    /// judgements of G |- t type
     fn well_formed(&self, ctx: &Ctx) -> bool {
         let wf = match self {
+            //
+            // ------------
+            // G |- Unit wf
             T::U => true,
+            // this seems questionable to me, do we need to
+            // distinguish between type and term vars?
+            //
+            // x \in G
+            // -----------
+            // G |- x type
             T::V(v) => ctx.contains(&B::V(v)),
+            // a \in G        a=t \in G
+            // -----------    -----------
+            // G |- a type    G |- a type
             T::X(v) => ctx.iter().any(|b| match b {
                 B::Ex(x) | B::Eq(x, _) => x == v,
                 _ => false,
             }),
+            // G,x |- t type
+            // -----------------
+            // G |- Pi x. t type
             T::P(v, t) => {
                 let mut ctx = ctx.to_vec();
                 ctx.push(B::V(v));
                 t.well_formed(&ctx)
             }
+            // G |- t1 type
+            // G |- t2 type
+            // ------------------
+            // G |- t1 -> t2 type
             T::A(a, b) => a.well_formed(&ctx) && b.well_formed(&ctx),
         };
         debug!("WF        {ctx:?} |- {self:?}  : {wf}");
         wf
     }
 
+    // substitution
     fn apply_ctx(&self, ctx: &Ctx) -> T {
         let t = match self {
+            // Unit[G] => Unit
             T::U => T::U,
+            // x[G] => x
             T::V(a) => T::V(a),
+            // a[G1,a,G2] => a
+            // a[G1,a=t,G2] => t[G1,a=t,G2]
             T::X(a) => {
                 if ctx.contains(&B::Ex(*a)) {
                     T::X(*a)
-                } else if let Some(t) = ctx.iter().find_map(|b| match b {
-                    B::Eq(a, t) => Some(t),
-                    _ => None,
-                }) {
-                    t.apply_ctx(ctx)
                 } else {
-                    panic!("typing context is not well-formed")
+                    match ctx.iter().filter(|b| matches!(b, B::Eq(_, _))).next() {
+                        Some(B::Eq(_, t)) => t.apply_ctx(ctx),
+                        _ => panic!("typing context is not well-formed"),
+                    }
                 }
             }
+            // (Pi x.t)[G] => Pi x.(t[G])
             T::P(x, a) => T::P(x, Box::new(a.apply_ctx(ctx))),
+            // (t1 -> t2)[G] => t1[G] -> t2[G]
             T::A(a, b) => T::A(Box::new(a.apply_ctx(ctx)), Box::new(b.apply_ctx(ctx))),
         };
         debug!("CTX_APPLY [{ctx:?}]{self:?}   = {t:?}");
         t
     }
 
+    /// in t, substitute b for any occurence of a
     fn subst(&mut self, a: &T, b: T) {
         let dbg_before = format!("[{a:?}/{b:?}]{self:?}");
         if self == a {
@@ -157,6 +205,7 @@ impl T {
         debug!("SUBST     {dbg_before}   = {self:?}");
     }
 
+    /// a \nin free_vars(t)
     fn nin_free(&self, a: usize) -> bool {
         let res = match self {
             T::U | T::V(_) => true,
@@ -168,16 +217,27 @@ impl T {
         res
     }
 
+    // subtyping relation  G |- t2 :< t1 -| D
     fn subtype(&self, ctx: &Ctx, rhs: &Self) -> Option<Vec<B>> {
         let d = match (self, rhs) {
+            //
+            // ----------------
+            // G |- t :< t -| G  in easy cases like Unit, or x \in G -> x :< x
             (T::U, T::U) => Some(ctx.to_vec()),
             (T::V(a), T::V(b)) if a == b && ctx.contains(&B::V(*a)) => Some(ctx.to_vec()),
             (T::X(a), T::X(b)) if a == b && ctx.contains(&B::Ex(*a)) => Some(ctx.to_vec()),
+            // G  |- t3 :< t1 -| G1
+            // G1 |- t2[G1] :< t4[G1] -| D
+            // ---------------------------------
+            // G  |- t1 -> t2  :<  t3 -> t4 -| D
             (T::A(a1, a2), T::A(b1, b2)) => {
-                let m = b1.subtype(ctx, b2)?;
+                let m = b1.subtype(ctx, a1)?;
                 let (a2, b2) = (a2.apply_ctx(&m), b2.apply_ctx(&m));
                 a2.subtype(&m, &b2)
             }
+            // G,@a,a |- t1[x/a] :< t2 -| D,@a,D1
+            // ----------------------------------
+            // G |- Pi x. t1 :< t2 -| D
             (T::P(x, a), b) => {
                 let y = new_id();
                 let mut a = a.clone();
@@ -185,11 +245,14 @@ impl T {
                 let mut ctx = ctx.to_vec();
                 let mark = B::M(y);
                 ctx.extend([mark.clone(), B::Ex(y)]);
-                let mut d = a.subtype(&ctx, rhs)?;
+                let mut d = a.subtype(&ctx, b)?;
                 truncate_ctx(&mut d, &mark)
-                    .expect("input context contained marker not foud in output context");
+                    .expect("input context contained marker not found in output context");
                 Some(d)
             }
+            // G,x |- t1 :< t2 -| D,x,D1
+            // -------------------------
+            // G |- t1 :< Pi x. t2 -| D
             (a, T::P(x, b)) => {
                 let mut ctx = ctx.to_vec();
                 let mark = B::V(x);
@@ -199,12 +262,22 @@ impl T {
                     .expect("output context did not contain expected variable");
                 Some(d)
             }
+            // a \nin FV(t)
+            // a \in G
+            // G |- ??? -| D
+            // ----------------
+            // G |- a :< t -| D
             (T::X(a), b) => {
                 if !(b.nin_free(*a) && ctx.contains(&B::Ex(*a))) {
                     return None;
                 }
                 b.subtype_inst(*a, ctx, true)
             }
+            // a \nin FV(t)
+            // a \in G
+            // G |- ??? -| D
+            // ----------------
+            // G |- t :< a -| D
             (a, T::X(b)) => {
                 if !(a.nin_free(*b) && ctx.contains(&B::Ex(*b))) {
                     return None;
@@ -219,12 +292,20 @@ impl T {
         d
     }
 
+    /// judgements of form  G |- t :=< a -| D   or   G |- a :=< t -| D
     fn subtype_inst(&self, a: usize, ctx: &Ctx, left: bool) -> Option<Vec<B>> {
         // every judgement requires G[a], so find it upfront
         let i = ctx.iter().enumerate().find(|(_, b)| b == &&B::Ex(a))?.0;
+        // G = Gi,@a,Gn
 
         let d = match self {
             // Inst?Solve
+            //
+            // mono(t)
+            // Gi |- t type
+            // -------------------------
+            // G |- t :=< a -| Gi,a=t,Gn
+            // G |- a :=< t -| Gi,a=t,Gn
             t if t.is_mono() && t.well_formed(&ctx[..i]) => {
                 let mut d = ctx.to_vec();
                 d[i] = B::Eq(a, t.clone());
@@ -413,6 +494,8 @@ impl E {
     }
 }
 
+/// search for a marker @a in context and take the prefix
+/// D1,@a,D2 => D1
 fn truncate_ctx(ctx: &mut Vec<B>, mark: &B) -> Option<()> {
     let (i, _) = ctx.iter().enumerate().rfind(|(_, b)| b == &mark)?;
     ctx.truncate(i);
