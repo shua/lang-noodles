@@ -321,13 +321,17 @@ fn main() {
         Rc::new(v)
     }
     let g = G::new();
-    let e = E::Comma(
+    let e = E::Par(rc(E::Comma(
         rc(E::Let(
             "x".to_string(),
             rc(E::Par(rc(E::Let("y".to_string(), rc(E::Unit))))),
         )),
         rc(E::Dot(rc(E::Var("x".to_string())), "y".to_string())),
-    );
+    )));
     let t = type_synth(&g, &e).expect("bad type");
     println!("{g} |- {e} : {t}");
+
+    let s = Scope::new();
+    let (s1, v) = eval(&s, &e);
+    println!("{s}({e}) --> ({} ; {})", s1, v);
 }
