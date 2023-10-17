@@ -35,17 +35,24 @@ use std::rc::Rc;
 #[derive(Clone, Debug)]
 enum Term {
     Unit,
+    Nat(usize),
     Var(String),
     Let(String, Rc<Term>),
     Par(Rc<Term>),
     Comma(Rc<Term>, Rc<Term>),
-    Dot(Rc<Term>, String),
+    Period(Rc<Term>, Rc<Term>),
+    Sub(Rc<Term>, String),
+    Fun(Rc<Type>, Rc<Term>),
+    Apply(Rc<Term>, Rc<Term>),
 }
 
 #[derive(Clone, Debug)]
 enum Type {
-    Unit,
-    Comma(Rc<Type>, Rc<(String, Type)>),
+    UnitT,
+    NatT,
+    Bind(String, Rc<Type>),
+    Pair(Rc<Type>, Rc<Type>),
+    Arrow(Rc<Type>, Rc<Type>),
 }
 
 #[derive(Clone, Debug)]
@@ -60,26 +67,27 @@ impl Ctx {
     }
 
     fn extend(&self, t: Type) -> Self {
-        match t {
-            Type::Unit => self.clone(),
-            Type::Comma(hd, tl) => {
-                let mut g = self.extend((*hd).clone());
-                g.0.insert(tl.0.clone(), Rc::new(tl.1.clone()));
-                g
+        fn bind(ctx: &mut Ctx, t: &Type) {
+            match t {
+                Type::Bind(x, t) => {
+                    ctx.0.insert(x.clone(), t.clone());
+                }
+                _ => {}
             }
         }
-    }
-}
-
-impl Type {
-    fn cons(self, x: String, t: Type) -> Type {
-        Type::Comma(Rc::new(self), Rc::new((x, t)))
-    }
-
-    fn append(self, rhs: &Type) -> Type {
-        match rhs {
-            Type::Unit => self,
-            Type::Comma(hd, tl) => Type::Comma(Rc::new(self.append(hd)), tl.clone()),
+        match t {
+            Type::Bind(_, _) => {
+                let mut g = self.clone();
+                bind(&mut g, &t);
+                g
+            }
+            Type::Pair(hd, tl) => {
+                let mut g = self.clone();
+                bind(&mut g, &hd);
+                let g = g.extend((*tl).clone());
+                g
+            }
+            _ => self.clone(),
         }
     }
 }
@@ -90,17 +98,20 @@ fn type_synth(g: &Ctx, e: &Term) -> Option<Type> {
         //
         // ------------
         // G |- {} : {}
-        Term::Unit => Some(Type::Unit),
+        Term::Unit => Some(Type::UnitT),
+        // ----------
+        // G |- n : N
+        Term::Nat(_) => Some(Type::NatT),
         // x:t \in G
         // ----------
         // G |- x : t
         Term::Var(x) => g.proj(x).cloned(),
         // G |- e : t
         // -------------------
-        // G |- x = e : {},x:t
+        // G |- x = e : x:t
         Term::Let(x, e) => {
             let t = type_synth(g, e)?;
-            Some(Type::Comma(Rc::new(Type::Unit), Rc::new((x.clone(), t))))
+            Some(Type::Bind(x.clone(), Rc::new(t)))
         }
         // G |- e : t
         // ------------
@@ -114,23 +125,104 @@ fn type_synth(g: &Ctx, e: &Term) -> Option<Type> {
             let t1 = type_synth(g, e1)?;
             let g2 = g.extend(t1.clone());
             let t2 = type_synth(&g2, e2)?;
-            Some(t1.append(&t2))
+            Some(Type::Pair(Rc::new(t1), Rc::new(t2)))
+        }
+        // G |- e1 : t1
+        // G,t1 |- e2 : t2
+        // ----------------
+        // G |- e1. e2 : t2
+        Term::Period(e1, e2) => {
+            let t1 = type_synth(g, e1)?;
+            let g2 = g.extend(t1);
+            let t2 = type_synth(&g2, e2)?;
+            Some(t2)
         }
         // G |- e : t1
         // x:t \in t1
         // ------------
         // G |- e.x : t
-        Term::Dot(e, x) => {
+        Term::Sub(e, x) => {
             let t = type_synth(g, e)?;
             fn proj(t: &Type, x: &str) -> Option<Type> {
                 match t {
-                    Type::Unit => None,
-                    Type::Comma(_, tl) if tl.0 == x => Some(tl.1.clone()),
-                    Type::Comma(hd, _) => proj(hd, x),
+                    Type::Bind(y, t) if y == x => Some((**t).clone()),
+                    Type::Pair(hd, tl) => proj(hd, x).or_else(|| proj(tl, x)),
+                    _ => None,
                 }
             }
             proj(&t, x)
         }
+
+        // G,t1 |- e: t2
+        // --------------------
+        // G |- \t1.e: t1 -> t2
+        Term::Fun(t, e) => {
+            let g = g.extend((**t).clone());
+            let t2 = type_synth(&g, e)?;
+            Some(Type::Arrow(t.clone(), Rc::new(t2)))
+        }
+        // G |- e1: t1 -> t
+        // G |- e2: t2
+        // |- t1 := t2
+        // ----------------
+        // G |- e1(e2) : t
+        Term::Apply(e1, e2) => {
+            let t1 = type_synth(g, e1)?;
+            if let Type::Arrow(t1, t) = t1 {
+                let t2 = type_synth(g, e2)?;
+                type_coerce(&t1, &t2)?;
+                Some((*t).clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// this is not transitive
+/// x:t := t and t := x:t, but 'y:t := x:t' is not true
+fn type_coerce(t1: &Type, t2: &Type) -> Option<()> {
+    match (t1, t2) {
+        // |- {} := {}
+        (Type::UnitT, Type::UnitT) => Some(()),
+        (Type::NatT, Type::NatT) => Some(()),
+        // |- t1 := t2
+        // -------------------
+        // |- x: t1 := x := t2
+        (Type::Bind(x, t1), Type::Bind(y, t2)) => {
+            if (x == y) {
+                type_coerce(t1, t2)
+            } else {
+                None
+            }
+        }
+        // |- t1 := t3
+        // |- t2 := t4
+        // -----------------
+        // |- t1,t2 := t3,t4
+        (Type::Pair(t1, t2), Type::Pair(t3, t4)) => {
+            type_coerce(t1, t3)?;
+            type_coerce(t2, t4)
+        }
+        // |- t3 := t1
+        // |- t2 := t4
+        // -------------------------
+        // |- t1 -> t2  :=  t3 -> t4
+        //
+        // |- x:{} -> y:{}  :=  {} -> {}
+        // . |- {} := x:{}
+        // . |- y:{} := {}
+        (Type::Arrow(t1, t2), Type::Arrow(t3, t4)) => {
+            type_coerce(t3, t1)?;
+            type_coerce(t2, t4)
+        }
+        // t2 != x: t3      t1 != x: t3
+        // |- t1 := t2      |- t1 := t2
+        // --------------   --------------
+        // |- x: t1 := t2   |- t1 := x: t2
+        (Type::Bind(x, t1), t2) => type_coerce(t1, t2),
+        (t1, Type::Bind(x, t2)) => type_coerce(t1, t2),
+        _ => None,
     }
 }
 
@@ -181,6 +273,8 @@ fn eval(s: &Scope, e: &Term) -> (Scope, Term) {
         // ------------------
         // s({}) --> ({}; {})
         Term::Unit => (s1, Term::Unit),
+        //
+        Term::Nat(n) => (s1, Term::Nat(*n)),
         // x=v \in s           x=v \nin s
         // ----------------    ----------------
         // s(x) --> ({}; v)    s(x) --> ({}; x)
@@ -209,23 +303,98 @@ fn eval(s: &Scope, e: &Term) -> (Scope, Term) {
         // s(e1) --> (s1 ; v1)
         // (s,s1)(e2) --> (s2 ; v2)
         // -----------------------------
-        // s(e1,e2) --> s(s1,s2 ; v1,v2)
+        // s(e1,e2) --> (s1,s2 ; v1,v2)
         Term::Comma(e1, e2) => {
             let (s1, v1) = eval(s, e1);
             let s = s.clone().extend(s1.clone());
             let (s2, v2) = eval(&s, e2);
             (s1.extend(s2), Term::Comma(Rc::new(v1), Rc::new(v2)))
         }
+        // s(e1) --> (s1 ; v1)
+        // (s,s1)(e2) --> (s2 ; v2)
+        // ------------------------
+        // s(e1. e2) --> (s2 ; v2)
+        Term::Period(e1, e2) => {
+            let (s1, v1) = eval(s, e1);
+            let s = s.clone().extend(s1.clone());
+            eval(&s, e2)
+        }
         // s(e) --> (s_e ; v_e)
         // x=v \in v_e
         // --------------------
         // s(e.x) --> ({} ; v)
-        Term::Dot(e, x) => {
+        Term::Sub(e, x) => {
             let (se, ve) = eval(s, e);
             let v = ve.proj(x).expect("bad type");
             (s1, v.clone())
         }
+
+        // (s-t)(e) --> (s1, e1)
+        // -----------------------
+        // s(\t.e) --> ({} ; \t.e1)
+        Term::Fun(t, e) => {
+            fn rmvars<'t>(s: &mut Scope, t: &'t Type) {
+                match t {
+                    Type::Bind(x, _) => {
+                        s.0.remove(x);
+                    }
+                    Type::Pair(t1, t2) => {
+                        rmvars(s, t1);
+                        rmvars(s, t2);
+                    }
+                    _ => {}
+                }
+            }
+            let mut s = s.clone();
+            rmvars(&mut s, t);
+            let (_, e1) = eval(&s, e);
+            (s1, Term::Fun(t.clone(), Rc::new(e1)))
+        }
+        // s(e1) --> (s1 ; \t.e)
+        // s(e2) --> (s2 ; v2)
+        // vc = val_coerce(t, v2)
+        // ({},vc)(e) --> (sv, v)
+        // ----------------------
+        // s(e1(e2)) --> ({}, v)
+        Term::Apply(e1, e2) => {
+            let (s1, v1) = eval(s, e1);
+            match v1 {
+                Term::Fun(t, e) => {
+                    let (s2, v2) = eval(s, e2);
+                    (Scope::new(), fun_apply(&t, &e, &v2).1)
+                }
+                _ => unreachable!("bad type"),
+            }
+        }
     }
+}
+
+fn fun_apply(t: &Type, e1: &Term, e2: &Term) -> (Scope, Term) {
+    debug!("fun_apply {t} {e1} {e2}");
+    fn inner(mut s: Scope, e: &Term, t: &Type) -> Scope {
+        match t {
+            Type::Bind(x, t) => match e {
+                Term::Let(y, v) => {
+                    if x == y {
+                        s.bind(y.clone(), (**v).clone())
+                    } else {
+                        unreachable!("bad type");
+                    }
+                }
+                e => s.bind(x.clone(), e.clone()),
+            },
+            Type::Pair(t1, t2) => match e {
+                Term::Comma(e1, e2) => {
+                    let mut s = inner(s, e1, t1);
+                    inner(s, e2, t2)
+                }
+                _ => unreachable!("bad type: pair ({t}) expected comma, got {e}"),
+            },
+            _ => s,
+        }
+    }
+    let s = inner(Scope::new(), e2, t);
+    eval(&s, &e1)
 }
 
 use std::fmt::Display;
@@ -235,19 +404,39 @@ impl Display for Term {
         fn disp(e: &Term, f: &mut std::fmt::Formatter, par: bool) -> std::fmt::Result {
             match e {
                 Term::Unit => f.write_str("{}"),
+                Term::Nat(n) => write!(f, "{n}"),
                 Term::Var(x) => f.write_str(x),
                 Term::Let(x, e) if par => write!(f, "({x} = {})", Par(e)),
                 Term::Let(x, e) => write!(f, "{x} = {}", Par(e)),
                 Term::Par(e) => write!(f, "{{{e}}}"),
                 Term::Comma(e1, e2) if par && matches!(**e1, Term::Comma(_, _)) => {
-                    write!(f, "({},{})", Par(e1), Par(e2))
+                    write!(f, "({}, {e2})", Par(e1))
                 }
-                Term::Comma(e1, e2) if par => write!(f, "({e1},{})", Par(e2)),
+                Term::Comma(e1, e2) if par => write!(f, "({e1}, {e2})"),
                 Term::Comma(e1, e2) if matches!(**e1, Term::Comma(_, _)) => {
-                    write!(f, "{},{}", Par(e1), Par(e2))
+                    write!(f, "{}, {e2}", Par(e1))
                 }
-                Term::Comma(e1, e2) => write!(f, "{e1},{}", Par(e2)),
-                Term::Dot(e, x) => write!(f, "{}.{x}", Par(e)),
+                Term::Comma(e1, e2) => write!(f, "{e1}, {e2}"),
+                Term::Period(e1, e2) => {
+                    if par {
+                        f.write_str("(")?;
+                    }
+                    let par1 = !matches!(&**e1, Term::Let(_, _) | Term::Comma(_, _));
+                    disp(e1, f, par1)?;
+                    f.write_str(". ")?;
+                    let par2 = !matches!(
+                        &**e2,
+                        Term::Let(_, _) | Term::Period(_, _) | Term::Comma(_, _)
+                    );
+                    disp(e2, f, par2)?;
+                    if par {
+                        f.write_str(")")?;
+                    }
+                    Ok(())
+                }
+                Term::Sub(e, x) => write!(f, "{}_{x}", Par(e)),
+                Term::Fun(t, e) => write!(f, "λ{{{t}. {e}}}"),
+                Term::Apply(e1, e2) => write!(f, "{e1}({e2})"),
             }
         }
         struct Par<'e>(&'e Term);
@@ -264,16 +453,32 @@ impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn disp(t: &Type, f: &mut std::fmt::Formatter, par: bool) -> std::fmt::Result {
             match t {
-                Type::Unit => f.write_str("{}"),
-                Type::Comma(hd, tl) => {
+                Type::UnitT => f.write_str("{}"),
+                Type::NatT => f.write_str("ℕ"),
+                Type::Bind(x, t) => {
+                    write!(f, "{x}:{t}")
+                }
+                Type::Pair(hd, tl) => {
                     if par {
                         f.write_str("(")?;
                     }
-                    disp(hd, f, true)?;
-                    write!(f, ",{}:", tl.0)?;
-                    disp(&tl.1, f, true)?;
+                    disp(hd, f, !matches!(&**hd, Type::Bind(_, _)))?;
+                    write!(f, ", ")?;
+                    disp(tl, f, !matches!(&**tl, Type::Bind(_, _) | Type::Pair(_, _)))?;
                     if par {
                         f.write_str(")")?;
+                    }
+                    Ok(())
+                }
+                Type::Arrow(t1, t2) => {
+                    if par {
+                        f.write_str("(")?;
+                    }
+                    disp(t1, f, true)?;
+                    f.write_str(" -> ")?;
+                    disp(t2, f, false)?;
+                    if par {
+                        f.write_str(")")?
                     }
                     Ok(())
                 }
@@ -316,17 +521,17 @@ impl Display for Scope {
 fn main() {
     env_logger::init();
 
-    use {Ctx as G, Scope as S, Term as E, Type as T};
+    use {Ctx as G, Scope as S, Term::*, Type::*};
     fn rc<T>(v: T) -> Rc<T> {
         Rc::new(v)
     }
     let g = G::new();
-    let e = E::Par(rc(E::Comma(
-        rc(E::Let(
+    let e = Par(rc(Comma(
+        rc(Let(
             "x".to_string(),
-            rc(E::Par(rc(E::Let("y".to_string(), rc(E::Unit))))),
+            rc(Par(rc(Let("y".to_string(), rc(Unit))))),
         )),
-        rc(E::Dot(rc(E::Var("x".to_string())), "y".to_string())),
+        rc(Sub(rc(Var("x".to_string())), "y".to_string())),
     )));
     let t = type_synth(&g, &e).expect("bad type");
     println!("{g} |- {e} : {t}");
@@ -334,4 +539,37 @@ fn main() {
     let s = Scope::new();
     let (s1, v) = eval(&s, &e);
     println!("{s}({e}) --> ({} ; {})", s1, v);
+
+    let f = Fun(
+        rc(Pair(
+            rc(Bind("x".to_string(), rc(UnitT))),
+            rc(Arrow(
+                rc(Bind("y".to_string(), rc(UnitT))),
+                rc(Bind("z".to_string(), rc(NatT))),
+            )),
+        )),
+        rc(Comma(
+            rc(Let("x".to_string(), rc(Var("x".to_string())))),
+            rc(Nat(7)),
+        )),
+    );
+    let e = Period(
+        rc(Comma(
+            rc(Let("f".to_string(), rc(f))),
+            rc(Let(
+                "y".to_string(),
+                rc(Comma(
+                    rc(Let("x".to_string(), rc(Unit))),
+                    rc(Fun(rc(UnitT), rc(Let("z".to_string(), rc(Nat(42)))))),
+                )),
+            )),
+        )),
+        rc(Apply(rc(Var("f".to_string())), rc(Var("y".to_string())))),
+    );
+    println!("{e}");
+    let t = type_synth(&g, &e).expect("bad type");
+    println!("{t}");
+    let s = Scope::new();
+    let (s, v) = eval(&s, &e);
+    println!("{{}}({e}) --> ({s} ; {v})");
 }
