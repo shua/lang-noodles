@@ -434,7 +434,7 @@ impl Display for Term {
                     }
                     Ok(())
                 }
-                Term::Sub(e, x) => write!(f, "{}_{x}", Par(e)),
+                Term::Sub(e, x) => write!(f, "{}/{x}", Par(e)),
                 Term::Fun(t, e) => write!(f, "λ{{{t}. {e}}}"),
                 Term::Apply(e1, e2) => write!(f, "{e1}({e2})"),
             }
@@ -554,22 +554,27 @@ fn main() {
         )),
     );
     let e = Period(
-        rc(Comma(
-            rc(Let("f".to_string(), rc(f))),
-            rc(Let(
-                "y".to_string(),
-                rc(Comma(
-                    rc(Let("x".to_string(), rc(Unit))),
-                    rc(Fun(rc(UnitT), rc(Let("z".to_string(), rc(Nat(42)))))),
-                )),
+        rc(Let(
+            "y".to_string(),
+            rc(Comma(
+                rc(Let("x".to_string(), rc(Unit))),
+                rc(Fun(rc(UnitT), rc(Let("z".to_string(), rc(Nat(42)))))),
             )),
         )),
-        rc(Apply(rc(Var("f".to_string())), rc(Var("y".to_string())))),
+        rc(Comma(
+            rc(Let("f".to_string(), rc(f))),
+            rc(Par(rc(Apply(
+                rc(Var("f".to_string())),
+                rc(Var("y".to_string())),
+            )))),
+        )),
     );
-    println!("{e}");
     let t = type_synth(&g, &e).expect("bad type");
-    println!("{t}");
+    println!("{{}} |- {e} : {t}");
     let s = Scope::new();
     let (s, v) = eval(&s, &e);
     println!("{{}}({e}) --> ({s} ; {v})");
+    // huh, no way to distinguish between a list of Pairs ending with a Pair or ending with the second of that last Pair
+    // probably because Pair is not like List.Cons, in that there's no List.Nil terminator, only other types
+    // is that a problem? no idea. Last example evals to {f=\..., x={}, 7} instead of expected {f=\..., {x={}, 7}}, but I guess {e} would eval to e anyway
 }
