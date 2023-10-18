@@ -1,7 +1,16 @@
 [workspace]
-resolver = "2"
+members = ["graphck"]
 
-members = [
-  "graphck",
-  "stray",
-]
+[workspace.dependencies]
+env_logger = "0.10.0"
+log = "0.4.20"
+
+[package]
+name = "lang-noodles"
+version = "0.1.0"
+edition = "2021"
+authors = ["shua <shua@isthisa.email>"]
+
+[dependencies]
+env_logger.workspace = true
+log.workspace = true
