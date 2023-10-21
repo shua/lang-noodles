@@ -35,60 +35,54 @@ impl<T: Debug + Any + PartialEq> Term for T {
 type RcTerm = Rc<dyn Term>;
 type Subst = (Var, RcTerm);
 type State = (Vec<Subst>, usize);
-enum Stream {
-    Nil,
-    Now(State, Box<Self>),
-    Later(Box<dyn FnOnce() -> Self>),
-}
 
-impl Stream {
-    fn join(self, s2: Stream) -> Stream {
-        match (self, s2) {
-            (Stream::Nil, s) | (s, Stream::Nil) => s,
-            (Stream::Now(hd, s1), s2) | (s2, Stream::Now(hd, s1)) => {
-                Stream::Now(hd, Box::new(s1.join(s2)))
-            }
-            (Stream::Later(s1), Stream::Later(s2)) => {
-                Stream::Later(Box::new(move || s1().join(s2())))
-            }
-        }
-    }
-
-    fn flat_map<F: (Fn(State) -> Stream) + 'static>(self, f: F) -> Stream {
-        match self {
-            Stream::Nil => Stream::Nil,
-            Stream::Now(sc, s2) => {
-                let s1 = f(sc);
-                s1.join((*s2).flat_map(f))
-            }
-            Stream::Later(s) => Stream::Later(Box::new(move || s().flat_map(f))),
-        }
-    }
-}
-
-impl std::iter::Iterator for Stream {
+type Query = Rc<dyn Fn(State) -> Goal>;
+// the original paper uses a recursive Stream type, like
+//     enum Stream<T> { Nil, Mature(T, Box<Self>), Immature(Box<dyn Fn() -> Self>) }
+// this may be easier for proofs because it lends itself to mutual recursion,
+// but I thought I'd try just keeping two sets as vecs: matures, and immatures.
+// Joining two goals is just joining the two sets (not, in the case of Stream::Immature,
+// moving closures inside other closures), and mapping a query (in the conj case),
+// is pretty much equivalent to Stream.
+#[derive(Default)]
+struct Goal(Vec<State>, Vec<(Rc<dyn Fn() -> Goal>, Vec<Query>)>);
+impl Iterator for Goal {
     type Item = State;
     fn next(&mut self) -> Option<State> {
-        match std::mem::replace(self, Stream::Nil) {
-            Stream::Nil => None,
-            Stream::Now(sc, s) => {
-                *self = *s;
-                Some(sc)
-            }
-            Stream::Later(s) => {
-                *self = s();
-                self.next()
-            }
+        if let Some(v) = self.0.pop() {
+            return Some(v);
         }
+        let (g, qs) = self.1.pop()?;
+        let mut g = g();
+        for q in qs {
+            g = g.map_query(&q);
+        }
+        self.join_eq(g);
+        self.next()
     }
 }
-
-enum Goal {
-    Fresh(Rc<dyn Fn(Var) -> Self>),
-    Disj(Rc<Self>, Rc<Self>),
-    Conj(Rc<Self>, Rc<Self>),
-    Equal(RcTerm, RcTerm),
-    Fn(Rc<dyn Fn(State) -> Stream>),
+impl Goal {
+    fn join_eq(&mut self, rhs: Goal) {
+        self.0.extend(rhs.0);
+        self.1.extend(rhs.1);
+    }
+    fn join(mut self, rhs: Goal) -> Goal {
+        self.join_eq(rhs);
+        self
+    }
+    fn map_query(mut self, q: &Query) -> Goal {
+        let mut sret = Goal(vec![], vec![]);
+        // if mature state is too big, we can always defer
+        // some of this work to an immature state.
+        for sc in self.0 {
+            sret.join_eq(q(sc));
+        }
+        sret.1 = self.1;
+        for (f, qs) in sret.1.iter_mut() {
+            qs.push(q.clone());
+        }
+        sret
+    }
 }
 
 fn as_var(u: &dyn Term) -> Option<Var> {
@@ -103,149 +97,85 @@ fn walk(u: &RcTerm, s: &State) -> RcTerm {
     f().unwrap_or_else(|| u.clone())
 }
 
-impl Goal {
-    fn query(&self, sc: State) -> Stream {
-        match self {
-            Goal::Fresh(f) => {
-                let (s, c) = sc;
-                f(Var::N(c)).query((s, c + 1))
-            }
-            Goal::Disj(g1, g2) => g1.query(sc.clone()).join(g2.query(sc)),
-            Goal::Conj(g1, g2) => {
-                let s = g1.query(sc);
-                let g2 = g2.clone();
-                s.flat_map(move |sc| g2.query(sc))
-            }
-            Goal::Equal(u, v) => {
-                fn unify(u: &RcTerm, v: &RcTerm, mut s: State) -> Option<State> {
-                    let (u, v) = (walk(u, &s), walk(v, &s));
-                    let ext_s = |v, t, mut s: State| {
-                        s.0.push((v, t));
-                        s
-                    };
-                    match (as_var(&*u), as_var(&*v)) {
-                        _ if u.eq_term(&*v) => Some(s),
-                        (Some(u), _) => Some(ext_s(u, v, s)),
-                        (_, Some(v)) => Some(ext_s(v, u, s)),
-                        _ => None,
-                    }
-                }
-                if let Some(sc) = unify(u, v, sc) {
-                    Stream::Now(sc, Box::new(Stream::Nil))
-                } else {
-                    Stream::Nil
-                }
-            }
-            Goal::Fn(gfn) => {
-                let gfn = gfn.clone();
-                Stream::Later(Box::new(move || gfn(sc)))
-            }
-        }
+fn lazy_goal<F: Fn() -> Query + 'static>(f: F) -> Query {
+    let f = Rc::new(f);
+    Rc::new(move |sc| {
+        let f = f.clone();
+        let f = Rc::new(move || f()(sc.clone()));
+        Goal(vec![], vec![(f, vec![])])
+    })
+}
+fn goal<F: Fn(State) -> Goal + 'static>(f: F) -> Query {
+    Rc::new(move |sc| f(sc))
+}
+fn fresh<F: Fn(Var) -> Query + 'static>(f: F) -> Query {
+    goal(move |(s, c)| f(Var::N(c))((s, c + 1)))
+}
+fn disj(q1: Query, q2: Query) -> Query {
+    goal(move |sc| q1(sc.clone()).join(q2(sc)))
+}
+fn conj(q1: Query, q2: Query) -> Query {
+    goal(move |sc| q1(sc).map_query(&q2))
+}
+fn equal_o<U: Term + 'static, V: Term + 'static>(u: U, v: V) -> Query {
+    let (u, v) = (rc_term(u), rc_term(v));
+    goal(move |sc| {
+        unify(&u, &v, sc)
+            .map(|sc| Goal(vec![sc], vec![]))
+            .unwrap_or_default()
+    })
+}
+fn unify(u: &RcTerm, v: &RcTerm, mut s: State) -> Option<State> {
+    let (u, v) = (walk(u, &s), walk(v, &s));
+    match (as_var(&*u), as_var(&*v)) {
+        _ if u.eq_term(&*v) => Some(s),
+        (Some(u), _) => Some({
+            s.0.push((u, v.clone()));
+            s
+        }),
+        (_, Some(_)) => unify(&v, &u, s),
+        _ => None,
     }
 }
-
-fn disj(g1: Goal, g2: Goal) -> Goal {
-    Goal::Disj(Rc::new(g1), Rc::new(g2))
-}
-fn conj(g1: Goal, g2: Goal) -> Goal {
-    Goal::Conj(Rc::new(g1), Rc::new(g2))
-}
-fn fresh<F: Fn(Var) -> Goal + 'static>(f: F) -> Goal {
-    Goal::Fresh(Rc::new(f))
-}
 fn rc_term<U: Term + 'static>(u: U) -> RcTerm {
-    (u.any().downcast_ref::<RcTerm>())
-        .cloned()
-        .unwrap_or_else(|| Rc::new(u))
-}
-fn equal_o<U: Term + 'static, V: Term + 'static>(u: U, v: V) -> Goal {
-    Goal::Equal(rc_term(u), rc_term(v))
-}
-fn goal<F: Fn(State) -> Stream + 'static>(f: F) -> Goal {
-    Goal::Fn(Rc::new(f))
+    Rc::new(u)
 }
 macro_rules! query {
     (|$x:ident $(, $xs:ident)*| $g:expr) => {{
         let ($x $(, $xs)*) = (Var::X(stringify!($x)) $(, Var::X(stringify!($xs)))*);
-        let s = $g.query((vec![], 0));
-        s.map(move |sc| {
+        ($g)((vec![], 0)).map(move |sc| {
             [($x, walk(&rc_term($x), &sc)) $(, ($xs, walk(&rc_term($xs), &sc)))*]
         })
     }};
 }
 macro_rules! disj {
     ($g1:expr) => { $g1 };
-    ($g1:expr, $($g:expr),*) => { disj($g1, disj!($($g),*)) };
+    ($g1:expr, $($g:expr),* $(,)?) => { disj($g1, disj!($($g),*)) };
 }
 macro_rules! conj {
     ($g1:expr) => { $g1 };
-    ($g1:expr, $($g:expr),*) => {conj($g1, conj!($($g),*)) };
-}
-
-// -- relational queries --
-trait TupTerm<const N: usize> {
-    fn into_terms(self) -> [RcTerm; N];
-}
-impl<T1: Term + 'static, T2: Term + 'static> TupTerm<2> for (T1, T2) {
-    fn into_terms(self) -> [RcTerm; 2] {
-        [rc_term(self.0), rc_term(self.1)]
-    }
-}
-impl<T1: Term + 'static, T2: Term + 'static, T3: Term + 'static> TupTerm<3> for (T1, T2, T3) {
-    fn into_terms(self) -> [RcTerm; 3] {
-        [rc_term(self.0), rc_term(self.1), rc_term(self.2)]
-    }
-}
-fn lookup<const N: usize, R: TupTerm<N>, Q: TupTerm<N>, Rel: IntoIterator<Item = R>>(
-    rel: Rel,
-    q: Q,
-) -> Goal {
-    let rel: Vec<_> = rel.into_iter().map(TupTerm::into_terms).collect();
-    let q = q.into_terms();
-    goal(move |sc| {
-        let mut vars = vec![];
-        let mut rel = rel.clone();
-        for (i, u) in q.iter().enumerate() {
-            let u = walk(u, &sc);
-            match as_var(&*u) {
-                Some(v) => vars.push((i, v)),
-                None => rel = rel.into_iter().filter(|r| (*r[i]).eq_term(&*u)).collect(),
-            }
-        }
-        if rel.is_empty() {
-            Stream::Nil
-        } else if vars.is_empty() {
-            Stream::Now(sc, Box::new(Stream::Nil))
-        } else {
-            let conj = |r: [RcTerm; N], mut sc: State| {
-                for &(i, v) in &vars {
-                    sc.0.push((v, r[i].clone()));
-                }
-                sc
-            };
-            let mut s = Stream::Nil;
-            for r in rel {
-                s = Stream::Now(conj(r, sc.clone()), Box::new(s));
-            }
-            s
-        }
-    })
+    ($g1:expr, $($g:expr),* $(,)?) => {conj($g1, conj!($($g),*)) };
 }
 
 fn main() {
-    fn parent(u: impl Term + 'static, v: impl Term + 'static) -> Goal {
-        const REL: [(&'static str, &'static str); 4] = [
-            ("bob", "sally"),
-            ("sharon", "sally"),
-            ("sally", "edith"),
-            ("sally", "toby"),
-        ];
-        lookup(REL, (u, v))
+    fn fives(x: Var) -> Query {
+        disj(equal_o(x, 5), lazy_goal(move || fives(x)))
     }
-    fn ancestor(u: impl Term + Clone + 'static, v: impl Term + Clone + 'static) -> Goal {
+    for vs in query!(|x| fives(x)).take(5) {
+        println!("{vs:?}");
+    }
+    fn parent(u: impl Term + Copy + 'static, v: impl Term + Copy + 'static) -> Query {
+        disj![
+            conj(equal_o(u, "bob"), equal_o(v, "sally")),
+            conj(equal_o(u, "sharon"), equal_o(v, "sally")),
+            conj(equal_o(u, "sally"), equal_o(v, "edith")),
+            conj(equal_o(u, "sally"), equal_o(v, "toby")),
+        ]
+    }
+    fn ancestor(u: impl Term + Copy + 'static, v: impl Term + Copy + 'static) -> Query {
         disj(
-            parent(u.clone(), v.clone()),
-            fresh(move |x| conj(parent(u.clone(), x), ancestor(x, v.clone()))),
+            parent(u, v),
+            fresh(move |x| conj(parent(u, x), ancestor(x, v))),
         )
     }
     let s = query!(|x| ancestor(x, "toby"));
