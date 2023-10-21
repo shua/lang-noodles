@@ -13,6 +13,7 @@ incomplete:
 - graphck: attempt to understand TLA+ by writing my own https://lamport.azurewebsites.net/tla/tla.html
 - ecmtt.rs: https://arxiv.org/abs/1202.0904 "Denotation of syntax and metaprogramming in contextual modal type theory (CMTT)"
 - fomega.rs: system-f-omega https://en.wikipedia.org/wiki/System_F#System_F%CF%89
+- fp2.rs: https://www.microsoft.com/en-us/research/uploads/prod/2023/05/fbip.pdf "FP²: Fully in-Place Functional Programming"
 
 experiments:
 - f_cap.rs: system-f but capabilities to limit availalable syntax
