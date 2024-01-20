@@ -1,5 +1,5 @@
 [workspace]
-members = ["graphck"]
+members = ["graphck", "subst", "subst_derive"]
 
 [workspace.dependencies]
 env_logger = "0.10.0"
