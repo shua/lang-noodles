@@ -4,6 +4,7 @@
 // Abstraction-Safe Effect Handlers via Tunneling
 
 use std::marker::PhantomData;
+use subst::{Subst, SubstAny};
 
 type Index = usize;
 type Lbl = usize;
@@ -14,50 +15,48 @@ enum Cap {
     L(Lbl),
     H(Index),
 }
-type Caps = Vec<Cap>;
 #[derive(Debug, Clone)]
+struct Caps(Vec<Cap>);
+#[derive(SubstAny, Debug, Clone)]
+#[subst_any(Box<Self>, Caps)]
 enum Type {
     Unit,
     Fn(Box<Self>, Box<Self>, Caps),
-    FFn(Box<Self>),
-    HFn(EffName, Box<Self>, Caps),
+    FFn(#[subst_bind] Box<Self>),
+    HFn(EffName, #[subst_bind] Box<Self>, Caps),
 }
 type EffName = String;
-#[derive(Debug, Clone)]
+#[derive(SubstAny, Debug, Clone)]
+#[subst_any(HDef)]
 enum Hdlr {
     H(Index),
     HH(HDef, Lbl),
 }
-type HDef = (EffName, Box<Term>);
 #[derive(Debug, Clone)]
+struct HDef(EffName, Box<Term>);
+#[derive(SubstAny, Debug, Clone)]
+#[subst_any(Val, Box<Self>, Type, Caps, Hdlr)]
 enum Term {
     V(Val),
     X(Index),
     App(Box<Self>, Box<Self>),
-    Let(Type, Box<Self>, Box<Self>),
+    Let(Type, Box<Self>, #[subst_bind] Box<Self>),
     FApp(Box<Self>, Caps),
     HApp(Box<Self>, Hdlr),
     UpH(Index),
     Dn(Lbl, Type, Caps, Box<Self>),
 }
-#[derive(Debug, Clone)]
+#[derive(SubstAny, Debug, Clone)]
+#[subst_any(Type, Box<Term>, HDef)]
 enum Val {
     Unit,
-    Fn(Type, Box<Term>),
-    FFn(Box<Term>),
-    HFn(EffName, Box<Term>),
+    Fn(Type, #[subst_bind] Box<Term>),
+    FFn(#[subst_bind] Box<Term>),
+    HFn(EffName, #[subst_bind] Box<Term>),
     UpHH(HDef, Lbl),
 }
 
-trait SubstAny<T> {
-    fn subst_any(&mut self, _x: Index, _v: T) {}
-}
-trait Subst<T>: SubstAny<T> {
-    fn subst(&mut self, x: Index, v: T) {
-        self.subst_any(x, v);
-    }
-}
-
+/*
 impl<T> SubstAny<T> for Val
 where
     T: Clone,
@@ -78,10 +77,6 @@ where
         }
     }
 }
-impl Subst<Val> for Val {}
-impl Subst<Lbls> for Val {}
-impl Subst<(HDef, Lbl)> for Val {}
-
 impl<T> SubstAny<T> for Term
 where
     T: Clone,
@@ -121,24 +116,6 @@ where
         }
     }
 }
-impl Subst<Val> for Term {
-    fn subst(&mut self, x: Index, v: Val) {
-        match self {
-            Term::X(y) if *y == x => *self = Term::V(v),
-            _ => self.subst_any(x, v),
-        }
-    }
-}
-impl Subst<Lbls> for Term {}
-impl Subst<(HDef, Lbl)> for Term {
-    fn subst(&mut self, x: Index, v: (HDef, Lbl)) {
-        match self {
-            Term::UpH(h) if *h == x => *self = Term::V(Val::UpHH(v.0, v.1)),
-            _ => self.subst_any(x, v),
-        }
-    }
-}
-
 impl<T> SubstAny<T> for Type
 where
     T: Clone,
@@ -160,19 +137,48 @@ where
         }
     }
 }
-impl<T> Subst<T> for Type where Type: SubstAny<T> {}
-
-impl<T> SubstAny<T> for Hdlr
+*/
+impl<T> SubstAny<T> for HDef
 where
     Term: Subst<T>,
 {
     fn subst_any(&mut self, x: Index, v: T) {
+        self.1.subst(x + 2, v)
+    }
+}
+impl<T> Subst<T> for HDef where Term: Subst<T> {}
+
+impl<T> SubstAny<T> for Caps {
+    fn subst_any(&mut self, _x: Index, _v: T) {}
+}
+
+impl Subst<Val> for Val {}
+impl Subst<Lbls> for Val {}
+impl Subst<(HDef, Lbl)> for Val {}
+impl Subst<Val> for Term {
+    fn subst(&mut self, x: Index, v: Val) {
         match self {
-            Hdlr::H(_) => {}
-            Hdlr::HH((_, e), _) => e.subst(x, v),
+            Term::X(y) if *y == x => *self = Term::V(v),
+            _ => self.subst_any(x, v),
         }
     }
 }
+impl Subst<Lbls> for Term {}
+impl Subst<(HDef, Lbl)> for Term {
+    fn subst(&mut self, x: Index, v: (HDef, Lbl)) {
+        match self {
+            Term::UpH(h) if *h == x => *self = Term::V(Val::UpHH(v.0, v.1)),
+            _ => self.subst_any(x, v),
+        }
+    }
+}
+impl<T> Subst<T> for Type
+where
+    Caps: Subst<T>,
+    T: Clone,
+{
+}
+
 impl Subst<Val> for Hdlr {}
 impl Subst<Lbls> for Hdlr {}
 impl Subst<(HDef, Lbl)> for Hdlr {
@@ -183,12 +189,10 @@ impl Subst<(HDef, Lbl)> for Hdlr {
         }
     }
 }
-
-impl<T> SubstAny<T> for Caps {}
 impl Subst<Val> for Caps {}
 impl Subst<(HDef, Lbl)> for Caps {
     fn subst(&mut self, x: Index, (_, l): (HDef, Lbl)) {
-        for c in self {
+        for c in &mut self.0 {
             match c {
                 Cap::H(h) if *h == x => *c = Cap::L(l.clone()),
                 _ => {}
@@ -200,23 +204,23 @@ impl Subst<Lbls> for Caps {
     fn subst(&mut self, x: Index, v: Lbls) {
         let mut found = false;
         let mut i = 0;
-        while i < self.len() - 1 {
-            match &self[i] {
+        while i < self.0.len() - 1 {
+            match &self.0[i] {
                 Cap::A(a) if *a == x => {
                     found = true;
-                    self.swap_remove(i);
+                    self.0.swap_remove(i);
                 }
                 _ => i += 1,
             }
         }
-        if let Some(Cap::A(a)) = self.last() {
+        if let Some(Cap::A(a)) = self.0.last() {
             if *a == x {
                 found = true;
-                self.pop();
+                self.0.pop();
             }
         }
         if found {
-            self.extend(v.into_iter().map(Cap::L));
+            self.0.extend(v.into_iter().map(Cap::L));
         }
     }
 }
@@ -238,9 +242,10 @@ impl EvalCtx {
             EvalCtx::Hole => e,
             EvalCtx::AppL(kk, e2) => Term::App(Box::new(kk.fill(e)), e2),
             EvalCtx::AppR(v, kk) => Term::App(Box::new(Term::V(v)), Box::new(kk.fill(e))),
-            EvalCtx::FApp(kk, f) => {
-                Term::FApp(Box::new(kk.fill(e)), f.into_iter().map(Cap::L).collect())
-            }
+            EvalCtx::FApp(kk, f) => Term::FApp(
+                Box::new(kk.fill(e)),
+                Caps(f.into_iter().map(Cap::L).collect()),
+            ),
             EvalCtx::HApp(kk, hh, l) => Term::HApp(Box::new(kk.fill(e)), Hdlr::HH(hh, l)),
             EvalCtx::Let(t, kk, e2) => Term::Let(t, Box::new(kk.fill(e)), e2),
             EvalCtx::Dn(l, t, f, kk) => Term::Dn(l, t, f, Box::new(kk.fill(e))),
@@ -264,7 +269,7 @@ fn eval(sigs: &Sigs, e: Term) -> Result<Val, (EvalCtx, Term)> {
         e2: Term,
     ) -> Result<Val, (EvalCtx, Term)> {
         match (e1, e2) {
-            (Term::V(Val::UpHH((ff, mut e), hl)), Term::V(v))
+            (Term::V(Val::UpHH(HDef(ff, mut e), hl)), Term::V(v))
                 if hl == l && op(sigs, &ff).is_some() =>
             {
                 let Some((_, t2)) = op(sigs, &ff) else {
@@ -313,14 +318,14 @@ fn eval(sigs: &Sigs, e: Term) -> Result<Val, (EvalCtx, Term)> {
             Ok(v) => Err((EvalCtx::Hole, Term::App(Box::new(Term::V(v)), e2))),
             Err((kk, e)) => Err((EvalCtx::AppL(Box::new(kk), e2), e)),
         },
-        Term::FApp(e, f) if f.iter().all(|c| matches!(c, Cap::L(_))) => {
-            let ls: Lbls = f
-                .into_iter()
-                .map(|c| match c {
-                    Cap::L(l) => l,
-                    _ => unreachable!(),
-                })
-                .collect();
+        Term::FApp(e, f) if f.0.iter().all(|c| matches!(c, Cap::L(_))) => {
+            let ls: Lbls =
+                f.0.into_iter()
+                    .map(|c| match c {
+                        Cap::L(l) => l,
+                        _ => unreachable!(),
+                    })
+                    .collect();
             match eval(*e) {
                 Ok(Val::FFn(mut v)) => {
                     v.subst(0, ls);
@@ -328,7 +333,10 @@ fn eval(sigs: &Sigs, e: Term) -> Result<Val, (EvalCtx, Term)> {
                 }
                 Ok(v) => Err((
                     EvalCtx::Hole,
-                    Term::FApp(Box::new(Term::V(v)), ls.into_iter().map(Cap::L).collect()),
+                    Term::FApp(
+                        Box::new(Term::V(v)),
+                        Caps(ls.into_iter().map(Cap::L).collect()),
+                    ),
                 )),
                 Err((kk, e)) => Err((EvalCtx::FApp(Box::new(kk), ls), e)),
             }
@@ -402,7 +410,7 @@ macro_rules! val {
     ($i:tt fn($x:ident : $($t:tt)*) $($e:tt)*) => { Val::Fn(typ_!($i $($t)*), Box::new({ let $x = MI($i, PhantomData::<Term>); expr_!(($i+1) $($e)*) })) };
     ($i:tt fn[$h:ident : $op:ident] $($e:tt)*) => { Val::HFn(stringify!($op).to_string(), Box::new({ let $h = MI($i, PhantomData::<Hdlr>); expr_!(($i+1) $($e)*) })) };
     ($i:tt fn^[$a:ident] $($v:tt)*) => { Val::FFn(Box::new({ let $a = MI::<Cap>($i, PhantomData); expr_!(($i+1) $($v)*) })) };
-    ($i:tt UP handler^$l:ident $op:ident ($x:ident, $k:ident) $($e:tt)+) => { Val::UpHH((stringify!($op).to_string(), Box::new({
+    ($i:tt UP handler^$l:ident $op:ident ($x:ident, $k:ident) $($e:tt)+) => { Val::UpHH(HDef(stringify!($op).to_string(), Box::new({
         let ($x, $k) = (MI($i), MI($i+1));
         expr_!(($i+2) $($e)*)
     })), $l) }
@@ -420,13 +428,13 @@ macro_rules! expr_ {
         let $l = genlbl();
         Term::Dn($l, typ_!($i $t), caps!($i $($c)*), Box::new(expr_!($i $($e)*)))
     }};
-    ($i:tt $e1:tt $e2:tt $($e3:tt)*) => { exprapp_!($i $e2 $($e3)*)(expr_!($i $e1)) };
+    ($i:tt $e1:tt $e2:tt $($e3:tt)*) => { exprapp_!($i (expr_!($i $e1)) $e2 $($e3)*) };
 }
 macro_rules! exprapp_ {
-    ($i:tt) => { |e: Term| e };
-    ($i:tt ^[$($c:tt)*] $($e:tt)*) => { |e1: Term| { exprapp_!($i $($e)*) (Term::FApp(Box::new(e1), caps!($i $($c)*))) } };
-    ($i:tt [$($h:tt)*] $($e:tt)*) => { |e1: Term| { exprapp_!($i $($e)*) (Term::HApp(Box::new(e1), hdlr!($i $($h)*))) } };
-    ($i:tt $e2:tt $($e:tt)*) => { |e1: Term| { exprapp_!($i $($e)*) (Term::App(Box::new(e1), Box::new(expr_!($i $e2)))) } };
+    ($i:tt $e1:tt) => { $e1 };
+    ($i:tt $e1:tt ^[$($c:tt)*] $($e:tt)*) => { exprapp_!($i (Term::FApp(Box::new($e1), caps!($i $($c)*))) $($e)*)  };
+    ($i:tt $e1:tt [$($h:tt)*] $($e:tt)*) => { exprapp_!($i (Term::HApp(Box::new($e1), hdlr!($i $($h)*))) $($e)*) };
+    ($i:tt $e1:tt $e2:tt $($e:tt)*) => { exprapp_!($i (Term::App(Box::new($e1), Box::new(expr_!($i $e2)))) $($e)*)  };
 }
 macro_rules! expr {
     ($($e:tt)*) => { expr_!(0 $($e)*) };
@@ -445,12 +453,12 @@ macro_rules! typ {
     ($($t:tt)*) => { typ_!(0 $($t)*) };
 }
 macro_rules! caps {
-    ($i:tt $($c:expr),*) => { vec![$(Cap::from(($i, $c))),*] };
+    ($i:tt $($c:expr),*) => { Caps(vec![$(Cap::from(($i, $c))),*]) };
 }
 macro_rules! hdlr {
     ($i:tt $h:ident) => { Hdlr::from(($i, $h)) };
     ($i:tt handler^$l:tt $op:ident ($x:ident, $k:ident) $($e:tt)+) => {
-        Hdlr::HH((stringify!($op).to_string(), Box::new({
+        Hdlr::HH(HDef(stringify!($op).to_string(), Box::new({
             let ($x, $k) = (MI($i, PhantomData::<Term>), MI($i+1, PhantomData::<Term>));
             expr_!(($i+2) $($e)*)
             /*Term::V(Val::Unit)*/

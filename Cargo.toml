@@ -14,3 +14,4 @@ authors = ["shua <shua@isthisa.email>"]
 [dependencies]
 env_logger.workspace = true
 log.workspace = true
+subst = { path = "./subst" }
