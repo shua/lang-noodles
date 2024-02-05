@@ -68,9 +68,46 @@ impl<T> SubstAny<T> for Caps {
     fn subst_any(&mut self, _x: Index, _v: T) {}
 }
 
-impl Subst<Val> for Val {}
-impl Subst<Lbls> for Val {}
-impl Subst<Hdlr> for Val {}
+// we override Subst<_> for Val because Val can introduce term bindings, and eff/hdlr bindings, which are disjoint in WFCtx
+impl Subst<Val> for Val {
+    fn subst(&mut self, x: usize, v: Val) {
+        match self {
+            Val::Unit => {}
+            Val::Fn(_, e) => e.subst(x + 1, v),
+            Val::FFn(e) => e.subst(x, v),
+            Val::HFn(_, e) => e.subst(x, v),
+            Val::UpHH(HDef(_, e, _)) => e.subst(x + 2, v),
+        }
+    }
+}
+impl Subst<Lbls> for Val {
+    fn subst(&mut self, x: usize, v: Lbls) {
+        match self {
+            Val::Unit => {}
+            Val::Fn(t, e) => {
+                t.subst(x, v.clone());
+                e.subst(x, v);
+            }
+            Val::FFn(e) => e.subst(x + 1, v),
+            Val::HFn(_, e) => e.subst(x + 1, v),
+            Val::UpHH(HDef(_, e, _)) => e.subst(x, v),
+        }
+    }
+}
+impl Subst<Hdlr> for Val {
+    fn subst(&mut self, x: usize, v: Hdlr) {
+        match self {
+            Val::Unit => {}
+            Val::Fn(t, e) => {
+                t.subst(x, v.clone());
+                e.subst(x, v);
+            }
+            Val::FFn(e) => e.subst(x + 1, v),
+            Val::HFn(_, e) => e.subst(x + 1, v),
+            Val::UpHH(HDef(_, e, _)) => e.subst(x, v),
+        }
+    }
+}
 impl Subst<Val> for Term {
     fn subst(&mut self, x: Index, v: Val) {
         match self {
@@ -492,6 +529,21 @@ fn eval_step(sigs: &Sigs, e: EvalStep) -> EvalStep {
 }
 
 struct MI<T>(usize, PhantomData<T>);
+impl MI<Term> {
+    fn term((i, j): (usize, usize)) -> (MI<Term>, (usize, usize)) {
+        (MI(i, PhantomData), (i + 1, j))
+    }
+}
+impl MI<Hdlr> {
+    fn hdlr((i, j): (usize, usize)) -> (MI<Hdlr>, (usize, usize)) {
+        (MI(j, PhantomData), (i, j + 1))
+    }
+}
+impl MI<Cap> {
+    fn cap((i, j): (usize, usize)) -> (MI<Cap>, (usize, usize)) {
+        (MI(j, PhantomData), (i, j + 1))
+    }
+}
 impl<T> Clone for MI<T> {
     fn clone(&self) -> Self {
         MI(self.0, PhantomData)
@@ -499,21 +551,22 @@ impl<T> Clone for MI<T> {
 }
 impl<T> Copy for MI<T> {}
 macro_rules! impl_from_mi {
-    ($($t2:ty as $t1:ty $(= $p:expr)?),* $(,)?) => {$(
-        impl From<(usize, $t2)> for $t1 {
-            fn from(v: (usize, $t2)) -> Self {
-                impl_from_mi!(@ v $(=> $p)?)
+    ($($t2:ty as $t1:ty $(: $p:tt => $e:expr)?),* $(,)?) => {$(
+        impl From<((usize, usize), $t2)> for $t1 {
+            fn from(v: ((usize, usize), $t2)) -> Self {
+                impl_from_mi!(@ v $($p => $e)?)
             }
         }
     )*};
-    (@ $v:ident => $p:expr) => { $p($v.0 - $v.1.0 - 1) };
+    (@ $v:ident ($i:pat, _) => $e:expr) => { $e($v.0.0 - $v.1.0 - 1) };
+    (@ $v:ident (_, $i:pat) => $e:expr) => { $e($v.0.1 - $v.1.0 - 1) };
     (@ $v:ident) => { $v.1 };
 }
 impl_from_mi! {
-    MI<Term> as Term = Term::X,
-    MI<Hdlr> as Hdlr = Hdlr::H,
-    MI<Cap> as Cap = Cap::A,
-    MI<Hdlr> as Cap = Cap::H,
+    MI<Term> as Term : (i, _) => Term::X,
+    MI<Hdlr> as Hdlr : (_, j) => Hdlr::H,
+    MI<Cap> as Cap : (_, j) => Cap::A,
+    MI<Hdlr> as Cap : (_, j) => Cap::H,
     Term as Term,
     Cap as Cap,
 }
@@ -537,11 +590,12 @@ fn genlbl() -> Lbl {
 
 macro_rules! val {
     ($i:tt ()) => { Val::Unit };
-    ($i:tt fn($x:ident : $($t:tt)*) $($e:tt)*) => { Val::Fn(typ_!($i $($t)*), Box::new({ let $x = MI($i, PhantomData::<Term>); expr_!(($i+1) $($e)*) })) };
-    ($i:tt fn[$h:ident : $op:tt] $($e:tt)*) => { Val::HFn($op.to_string(), Box::new({ let $h = MI($i, PhantomData::<Hdlr>); expr_!(($i+1) $($e)*) })) };
-    ($i:tt fn^[$a:ident] $($v:tt)*) => { Val::FFn(Box::new({ let $a = MI::<Cap>($i, PhantomData); expr_!(($i+1) $($v)*) })) };
+    ($i:tt fn($x:ident : $($t:tt)*) $($e:tt)*) => { Val::Fn(typ_!($i $($t)*), Box::new({ let ($x, $i) = MI::term($i); expr_!($i $($e)*) })) };
+    ($i:tt fn[$h:ident : $op:tt] $($e:tt)*) => { Val::HFn($op.to_string(), Box::new({ let ($h, $i) = MI::hdlr($i); expr_!($i $($e)*) })) };
+    ($i:tt fn^[$a:ident] $($v:tt)*) => { Val::FFn(Box::new({ let ($a, $i) = MI::cap($i); expr_!($i $($v)*) })) };
     ($i:tt UP handler^$l:ident $op:ident ($x:ident, $k:ident) $($e:tt)+) => { Val::UpHH(HDef(stringify!($op).to_string(), Box::new({
-        let ($x, $k) = (MI($i), MI($i+1));
+        let ($x, $i) = MI::term($i);
+        let ($k, $i) = MI::term($i);
         expr_!(($i+2) $($e)*)
     })), $l) }
 }
@@ -549,8 +603,8 @@ macro_rules! expr_ {
     ($i:tt $x:ident) => { Term::from(($i, $x)) };
     ($i:tt ()) => { Term::V(val!($i ())) };
     ($i:tt ($($e:tt)+)) => { expr_!($i $($e)*) };
-    ($i:tt let $x:ident : $t:tt = $e1:tt ; $($e2:tt)*) => { Term::Let(typ_!($i $t), Box::new(expr_!($i $e1)), Box::new({ let $x = MI($i, PhantomData::<Term>); expr_!(($i+1) $($e2)*)})) };
-    ($i:tt let _ : $t:tt = $e1:tt ; $($e2:tt)*) => { Term::Let(typ_!($i $t), Box::new(expr_!($i $e1)), Box::new(expr_!(($i+1) $($e2)*))) };
+    ($i:tt let $x:ident : $t:tt = $e1:tt ; $($e2:tt)*) => { Term::Let(typ_!($i $t), Box::new(expr_!($i $e1)), Box::new({ let ($x, $i) = MI::term($i); expr_!($i $($e2)*)})) };
+    ($i:tt let _ : $t:tt = $e1:tt ; $($e2:tt)*) => { Term::Let(typ_!($i $t), Box::new(expr_!($i $e1)), Box::new(expr_!($i $($e2)*))) };
     ($i:tt fn $($e:tt)*) => { Term::V(val!($i fn $($e)*)) };
     ($i:tt UP $($h:tt)*) => { Term::up(hdlr!($i $($h)*)) };
     ($i:tt DN^$l:ident : $t:tt ^[$($c:tt)*] . $($e:tt)*) => {{
@@ -565,33 +619,35 @@ macro_rules! exprapp_ {
     ($i:tt $e1:tt [$($h:tt)*] $($e:tt)*) => { exprapp_!($i (Term::HApp(Box::new($e1), hdlr!($i $($h)*))) $($e)*) };
     ($i:tt $e1:tt $e2:tt $($e:tt)*) => { exprapp_!($i (Term::App(Box::new($e1), Box::new(expr_!($i $e2)))) $($e)*)  };
 }
-macro_rules! expr { ($($e:tt)*) => { expr_!(0 $($e)*) }; }
+macro_rules! expr { ($($e:tt)*) => {{ let (i,j) = (0,0); expr_!((i,j) $($e)*) }}; }
 macro_rules! typ_ {
     ($i:tt ()) => { Type::Unit };
     ($i:tt $x:ident) => { Type::from($x) };
     ($i:tt ($($t:tt)+)) => { typ_!($i $($t)*) };
     ($i:tt fn($($s:tt)*)^$c:tt $($t:tt)*) => { Type::Fn(Box::new(typ_!($i ($($s)*))), Box::new(typ_!($i $($t)*)), caps_!($i $c)) };
     ($i:tt fn($($s:tt)*) $($t:tt)*) => { typ_!($i fn($($s)*)^[] $($t)*) };
-    ($i:tt fn^[$a:ident] $($t:tt)*) => { Type::FFn(Box::new({ let $a = MI($i, PhantomData::<Cap>); typ_!(($i+1) $($t)*) })) };
+    ($i:tt fn^[$a:ident] $($t:tt)*) => { Type::FFn(Box::new({ #[allow(unused)] let ($a, $i) = MI::cap($i); typ_!($i $($t)*) })) };
     //($i:tt fn^[$a:ident] $($t:tt)*) => { Type::FFn(Box::new(Type::Unit)) };
     ($i:tt fn[$h:tt: $F:tt]^$c:tt $($t:tt)*) => {{
-        let $h = MI($i, PhantomData::<Hdlr>);
-        Type::HFn($F.to_string(), Box::new(typ_!(($i+1) $($t)*)), caps_!(($i+1) $c))
+        #[allow(unused)]
+        let ($h, $i) = MI::hdlr($i);
+        Type::HFn($F.to_string(), Box::new(typ_!($i $($t)*)), caps_!(($i+1) $c))
     }};
     ($i:tt fn[$h:tt: $F:tt] $($t:tt)*) => { typ_!($i fn[$h: $F]^[] $($t)*) };
 }
-macro_rules! typ { ($($t:tt)*) => { typ_!(0 $($t)*) }; }
+macro_rules! typ { ($($t:tt)*) => {{ #[allow(unused)] let (i,j) = (0,0); typ_!((i,j) $($t)*) }}; }
 macro_rules! caps_ {
     ($i:tt $c:ident) => { $c };
     ($i:tt [$($c:expr),*]) => { Caps(vec![$(Cap::from(($i, $c))),*]) };
 }
-macro_rules! caps { ($($c:tt)*) => { caps_!(0 [$($c)*]) }; }
+macro_rules! caps { ($($c:tt)*) => {{ #[allow(unused)] let (i,j) = (0,0); caps_!((i,j) [$($c)*]) }}; }
 macro_rules! hdlr {
     ($i:tt $h:ident) => { Hdlr::from(($i, $h)) };
     ($i:tt handler^$l:tt $op:tt ($x:ident, $k:ident) $($e:tt)+) => {
         Hdlr::HH(HDef($op.to_string(), Box::new({
-            let ($x, $k) = (MI($i, PhantomData::<Term>), MI($i+1, PhantomData::<Term>));
-            expr_!(($i+2) $($e)*)
+            let ($x, $i) = MI::term($i);
+            let ($k, $i) = MI::term($i);
+            expr_!($i $($e)*)
             /*Term::V(Val::Unit)*/
         }), $l))
     };
@@ -601,23 +657,30 @@ macro_rules! hdlr {
 enum CtxBinding {
     Eff,
     Hdlr(EffName),
-    Term(Type),
 }
 #[derive(Clone)]
-struct WFCtx<'s>(Vec<CtxBinding>, Map<Lbl, (Type, Caps)>, &'s Sigs);
+struct WFCtx<'s> {
+    term: Vec<Type>,
+    ty: Vec<CtxBinding>,
+    lbl: Map<Lbl, (Type, Caps)>,
+    sig: &'s Sigs,
+}
 impl std::fmt::Debug for WFCtx<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("{}")?;
-        for c in &self.0 {
+        for t in &self.term {
+            write!(f, ", x:{t:?}")?;
+        }
+        f.write_str("|{}")?;
+        for c in &self.ty {
             match c {
                 CtxBinding::Eff => write!(f, ", a")?,
                 CtxBinding::Hdlr(ff) => write!(f, ", h:{ff:?}")?,
-                CtxBinding::Term(t) => write!(f, ", x:{t:?}")?,
             }
         }
         f.write_str(" | ")?;
         f.write_str("{}")?;
-        for (k, v) in &self.1 {
+        for (k, v) in &self.lbl {
             write!(f, ", {k}:L : {:?}^{:?}", v.0, v.1)?;
         }
         Ok(())
@@ -625,20 +688,21 @@ impl std::fmt::Debug for WFCtx<'_> {
 }
 impl WFCtx<'_> {
     fn get(&self, x: usize) -> Option<&CtxBinding> {
-        if x < self.0.len() {
-            self.0.get(self.0.len() - x - 1)
+        if x < self.ty.len() {
+            self.ty.get(self.ty.len() - x - 1)
         } else {
             None
         }
     }
     fn get_e(&self, x: usize) -> Option<&Type> {
-        self.get(x).and_then(|x| match x {
-            CtxBinding::Term(e) => Some(e),
-            _ => None,
-        })
+        if x < self.term.len() {
+            self.term.get(self.term.len() - x - 1)
+        } else {
+            None
+        }
     }
     fn get_l(&self, x: usize) -> Option<&(Type, Caps)> {
-        self.1.get(&x)
+        self.lbl.get(&x)
     }
     fn get_h(&self, x: usize) -> Option<&EffName> {
         self.get(x).and_then(|x| match x {
@@ -653,7 +717,28 @@ impl WFCtx<'_> {
         })
     }
     fn get_op(&self, ff: &EffName) -> Option<&(Type, Type)> {
-        self.2.get(ff)
+        self.sig.get(ff)
+    }
+}
+
+// Shift is a newtype used to shift de bruijn indices
+#[derive(Clone, Copy)]
+struct Shift(i32);
+
+impl Subst<Shift> for Caps {
+    fn subst(&mut self, x: usize, v: Shift) {
+        for c in &mut self.0 {
+            match c {
+                Cap::A(y) | Cap::L(y) | Cap::H(y) if *y >= x => {
+                    if v.0 > 0 {
+                        *y = *y + (v.0 as usize)
+                    } else {
+                        *y = *y - ((-v.0) as usize)
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -669,12 +754,12 @@ fn t_wf(ctx: &WFCtx, t: &Type) -> Option<()> {
         }
         Type::FFn(t) => {
             let mut ctx = ctx.clone();
-            ctx.0.push(CtxBinding::Eff);
+            ctx.ty.push(CtxBinding::Eff);
             t_wf(&ctx, t)
         }
         Type::HFn(ff, t, c) => {
             let mut ctx = ctx.clone();
-            ctx.0.push(CtxBinding::Hdlr(ff.clone()));
+            ctx.ty.push(CtxBinding::Hdlr(ff.clone()));
             t_wf(&ctx, t)?;
             c_wf(&ctx, c)?;
             Some(())
@@ -695,12 +780,12 @@ fn t_sub<'a, 's>(ctx: &WFCtx<'s>, t1: &Type, t2: &Type) -> Result<(), TySynErr<'
         }
         (Type::FFn(t1), Type::FFn(t2)) => {
             let mut ctx = ctx.clone();
-            ctx.0.push(CtxBinding::Eff);
+            ctx.ty.push(CtxBinding::Eff);
             t_sub(&ctx, t1, t2)
         }
         (Type::HFn(ff1, t1, c1), Type::HFn(ff2, t2, c2)) if ff1 == ff2 => {
             let mut ctx = ctx.clone();
-            ctx.0.push(CtxBinding::Hdlr(ff1.clone()));
+            ctx.ty.push(CtxBinding::Hdlr(ff1.clone()));
             t_sub(&ctx, t1, t2)?;
             c_sub(&ctx, c1, c2)
                 .ok_or_else(|| TySynErr::CSub(ctx.clone(), c1.clone(), c2.clone()))?;
@@ -734,19 +819,18 @@ fn h_fsyn_hh<'a, 's>(
     ctx: &WFCtx<'s>,
     hh @ HDef(op, e, l): &'a HDef,
 ) -> Result<(EffName, Cap), TySynErr<'a, 's>> {
+    // XXX: any indices in s that reach past l should be raised?
     let (s, c) = ctx
         .get_l(*l)
         .ok_or_else(|| TySynErr::FSyn(ctx.clone(), Hdlr::HH(hh.clone())))?;
-    // XXX: any indices in s that reach past l should be raised?
     let (t1, t2) = ctx
         .get_op(op)
         .ok_or_else(|| TySynErr::FSyn(ctx.clone(), Hdlr::HH(hh.clone())))?;
-    // XXX: I think t1 and t2 can't have any indices because they are static signatures
     let mut ctx: WFCtx<'s> = ctx.clone();
+    ctx.term.push(t1.clone());
     // XXX: this doesn't seem correct, at least c should be lowered if it's being put inside something
-    ctx.0.push(CtxBinding::Term(t1.clone()));
     let (t2, cc, ss) = (t2.clone(), c.clone(), s.clone());
-    ctx.0.push(CtxBinding::Term(typ!(fn(t2)^cc ss)));
+    ctx.term.push(typ!(fn(t2)^cc ss));
     let (s2, c2) = e_tysyn(&ctx, e)?;
     t_sub(&ctx, &s2, s)?;
     c_sub(&ctx, &c2, c).ok_or_else(|| TySynErr::CSub(ctx.clone(), c2, c.clone()))?;
@@ -806,26 +890,6 @@ enum TySynErr<'a, 's> {
 }
 /// G |- e: [T]_c
 fn e_tysyn<'a, 's>(ctx: &WFCtx<'s>, e: &'a Term) -> Result<(Type, Caps), TySynErr<'a, 's>> {
-    fn raise<'a, 's>(ctx: &WFCtx<'s>, t: &mut Type, c: &mut Caps) {
-        let mut j = 0;
-        for (i, b) in ctx.0.iter().rev().enumerate() {
-            match b {
-                CtxBinding::Eff => {
-                    // dbg!(("raise_a", i, j));
-                    t.subst(i, Caps(vec![Cap::A(j)]));
-                    c.subst(i, Caps(vec![Cap::A(j)]));
-                    j += 1;
-                }
-                CtxBinding::Hdlr(_) => {
-                    // dbg!(("raise_h", i, j, &t, &c));
-                    t.subst(i, Hdlr::H(j));
-                    c.subst(i, Hdlr::H(j));
-                    j += 1;
-                }
-                CtxBinding::Term(_) => {}
-            }
-        }
-    }
     fn t_up<'a, 's>(
         ctx: &WFCtx<'s>,
         ff: EffName,
@@ -856,9 +920,9 @@ fn e_tysyn<'a, 's>(ctx: &WFCtx<'s>, e: &'a Term) -> Result<(Type, Caps), TySynEr
             Term::V(Val::Fn(t, e)) => {
                 t_wf(ctx, t).ok_or_else(|| TySynErr::TWF(ctx.clone(), t))?;
                 let mut ctx: WFCtx<'s> = ctx.clone();
-                ctx.0.push(CtxBinding::Term(t.clone()));
-                let (mut t2, mut cs) = e_tysyn(&ctx, e)?;
-                raise(&ctx, &mut t2, &mut cs);
+                ctx.term.push(t.clone());
+                let (t2, cs) = e_tysyn(&ctx, e)?;
+                // raise(&ctx, &mut t2, &mut cs);
                 let t = t.clone();
                 Ok((typ!(fn(t)^cs t2), caps![]))
             }
@@ -885,14 +949,14 @@ fn e_tysyn<'a, 's>(ctx: &WFCtx<'s>, e: &'a Term) -> Result<(Type, Caps), TySynEr
                 let (t1, c1) = e_tysyn(ctx, e1)?;
                 t_sub(ctx, &t1, t)?;
                 let mut ctx = ctx.clone();
-                ctx.0.push(CtxBinding::Term(t.clone()));
+                ctx.term.push(t.clone());
                 let (t2, c2) = e_tysyn(&ctx, e2)?;
                 Ok((t2, c_merge(c1, c2)))
             }
             // T-EABS
             e0 @ Term::V(Val::FFn(e)) => {
                 let mut ctx = ctx.clone();
-                ctx.0.push(CtxBinding::Eff);
+                ctx.ty.push(CtxBinding::Eff);
                 let (t, c) = e_tysyn(&ctx, e)?;
                 // no way to get t:[T]_{}  from  t:[T]_c'
                 // because T-SUB requires c'<:{} which cannot be true
@@ -915,7 +979,7 @@ fn e_tysyn<'a, 's>(ctx: &WFCtx<'s>, e: &'a Term) -> Result<(Type, Caps), TySynEr
             // T-HABS
             Term::V(Val::HFn(ff, e)) => {
                 let mut ctx = ctx.clone();
-                ctx.0.push(CtxBinding::Hdlr(ff.clone()));
+                ctx.ty.push(CtxBinding::Hdlr(ff.clone()));
                 let (t, c) = e_tysyn(&ctx, e)?;
                 let ff = ff.clone();
                 Ok((typ!(fn[_: ff]^c t), caps![]))
@@ -950,7 +1014,7 @@ fn e_tysyn<'a, 's>(ctx: &WFCtx<'s>, e: &'a Term) -> Result<(Type, Caps), TySynEr
                 // say ctx.len() == 4, l == 0, c == [1:H]
                 // then
                 let mut ctx = ctx.clone();
-                ctx.1.insert(*l, (t.clone(), c.clone()));
+                ctx.lbl.insert(*l, (t.clone(), c.clone()));
                 let (t1, c1) = e_tysyn(&ctx, e)?;
                 t_sub(&ctx, &t1, t)?;
                 let c2 = c_merge(c.clone(), Caps(vec![Cap::L(*l)]));
@@ -980,14 +1044,12 @@ fn main() {
     // println!("{:?}", eval(&sigs, try_with));
 
     let fiterate = expr! {
-        fn[h: "yield"] fn^[a] fn(tr: ()) fn(f: fn(())^[h,a] ())
+        fn[h: "yield"] fn^[a] fn(tr: ()) fn(f: fn()^[a] ())
             let _ : () = (f ());
             (UP h) tr
     };
     let fsize1 = expr! {
-        fn^[a]
-        fn(tr: ())
-        fn(f: fn()^[a] ())
+        fn^[a] fn(tr: ()) fn(f: fn()^[a] ())
             let num: () = ();
             let _ : () = (DN^l : ()^[] .
                 (fn[hi:"yield"]
@@ -996,9 +1058,7 @@ fn main() {
             num
     };
     let fsize2 = expr! {
-        fn^[a]
-        fn(tr: ())
-        fn(f: fn()^[a] ())
+        fn^[a] fn(tr: ()) fn(f: fn()^[a] ())
             f tr
     };
     let ex3a = expr! {
@@ -1006,14 +1066,22 @@ fn main() {
             let _ : () = ((UP h) ()); x);
         DN^l : ()^[] . (
             (fn[h:"yield"]
-                fsize2 ^[h] () (g[h]))
+                fsize1 ^[h] () (g[h]))
             [handler^l "yield"(_x, k) k ()])
     };
 
     println!("ex3a := {:?}", &ex3a);
     println!(
         "{{}} |- ex3a : {:?}",
-        e_tysyn(&WFCtx(vec![], Map::new(), &sigs), &ex3a)
+        e_tysyn(
+            &WFCtx {
+                term: vec![],
+                ty: vec![],
+                lbl: Map::new(),
+                sig: &sigs
+            },
+            &ex3a
+        )
     );
     println!("ex3a --> {:?}", eval(&sigs, ex3a.clone()));
     // let mut esteps = EvalStep::Progress(EvalCtx::Hole, ex3a);
